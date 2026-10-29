@@ -1,28 +1,30 @@
 import {
-  collection,
-  doc,
-  getDocs,
-  query,
-  serverTimestamp,
-  setDoc,
-  where,
-  WriteBatch,
-  writeBatch,
-} from 'firebase/firestore';
-import { db, handleFirestoreError, OperationType } from '../lib/firebase';
+  deleteLocalAssetAndEnqueue,
+  getLocalAssetsForOwner,
+  getLocalEventsForAsset,
+  getPendingOutboxForOwner,
+  OutboxMutation,
+  putLocalAssetAndEvent,
+  reconcileRemoteAssets,
+  reconcileRemoteEvents,
+  removeOutboxItemAndMarkSynced,
+  StoredAsset,
+  StoredEvent,
+} from '../lib/offlineDb';
 import {
-  cacheReportingCurrencyLocally,
-  convertCurrency,
-  CURRENCY_META,
-  CurrencyCode,
-  getCrossRate,
-  isValidCurrencyCode,
-} from '../lib/currency';
+  apiCreateAsset,
+  apiDeleteAsset,
+  apiFetchAssetEvents,
+  apiFetchAssets,
+  apiUpdateAsset,
+  getAccessToken,
+} from '../lib/supabaseApi';
 import {
   ASSET_CATEGORIES,
   ASSET_STATUSES,
   AssetCategory,
   AssetEventAction,
+  AssetEventRecord,
   AssetFormInput,
   AssetRecord,
   AssetStatus,
@@ -36,7 +38,6 @@ export interface ValidatedAssetPayload {
   name: string;
   serialNumber: string;
   category: AssetCategory;
-  currency: CurrencyCode;
   purchasePrice: number;
   currentValuation: number;
   purchaseDate: string;
@@ -49,10 +50,20 @@ export interface ValidatedAssetPayload {
   photoUrl: string;
 }
 
-/**
- * Enforces blueprint volumetric, ISO currency, and regex constraints on outgoing mutations
- * prior to Firestore execution (Validation Synchronicity).
- */
+type InventoryListener = () => void;
+const listeners = new Set<InventoryListener>();
+
+export function subscribeToInventoryChanges(listener: InventoryListener): () => void {
+  listeners.add(listener);
+  return () => {
+    listeners.delete(listener);
+  };
+}
+
+function notifyInventoryListeners() {
+  listeners.forEach((fn) => fn());
+}
+
 export function sanitizeAndValidateAssetInput(input: AssetFormInput): ValidatedAssetPayload {
   const name = input.name.trim().slice(0, SCHEMA_LIMITS.NAME_MAX_LEN);
   if (!name) {
@@ -68,17 +79,9 @@ export function sanitizeAndValidateAssetInput(input: AssetFormInput): ValidatedA
     throw new Error('Please select a valid asset category.');
   }
 
-  if (!isValidCurrencyCode(input.currency)) {
-    throw new Error('Please select a supported ISO currency.');
-  }
-
   if (!ASSET_STATUSES.includes(input.status)) {
     throw new Error('Please select a valid lifecycle status.');
   }
-
-  const isZeroDec = Boolean(CURRENCY_META[input.currency].zeroDecimal);
-  const roundMoney = (val: number) =>
-    isZeroDec ? Math.round(val) : Math.round(val * 100) / 100;
 
   const purchasePrice = Number(input.purchasePrice);
   if (
@@ -86,7 +89,7 @@ export function sanitizeAndValidateAssetInput(input: AssetFormInput): ValidatedA
     purchasePrice < 0 ||
     purchasePrice > SCHEMA_LIMITS.MAX_MONETARY_VALUE
   ) {
-    throw new Error('Purchase price must be between 0 and 1,000,000,000.');
+    throw new Error('Purchase price must be between $0 and $1,000,000,000.');
   }
 
   const currentValuation = Number(input.currentValuation);
@@ -95,7 +98,7 @@ export function sanitizeAndValidateAssetInput(input: AssetFormInput): ValidatedA
     currentValuation < 0 ||
     currentValuation > SCHEMA_LIMITS.MAX_MONETARY_VALUE
   ) {
-    throw new Error('Current valuation must be between 0 and 1,000,000,000.');
+    throw new Error('Current valuation must be between $0 and $1,000,000,000.');
   }
 
   const purchaseDate = input.purchaseDate.trim();
@@ -129,9 +132,8 @@ export function sanitizeAndValidateAssetInput(input: AssetFormInput): ValidatedA
     name,
     serialNumber,
     category: input.category,
-    currency: input.currency,
-    purchasePrice: roundMoney(purchasePrice),
-    currentValuation: roundMoney(currentValuation),
+    purchasePrice: Math.round(purchasePrice * 100) / 100,
+    currentValuation: Math.round(currentValuation * 100) / 100,
     purchaseDate,
     warrantyExpiry,
     status: input.status,
@@ -143,120 +145,155 @@ export function sanitizeAndValidateAssetInput(input: AssetFormInput): ValidatedA
   };
 }
 
-async function commitBatchOfflineAware(
-  batch: WriteBatch,
-  operationType: OperationType,
-  path: string,
-  isOnline: boolean
-): Promise<'synced' | 'queued-offline'> {
-  const commitPromise = batch.commit().catch((error) => {
-    handleFirestoreError(error, operationType, path);
-  });
+let isFlushing = false;
 
-  if (!isOnline) {
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    return 'queued-offline';
+/**
+ * Flushes all queued offline mutations in FIFO order to Supabase PostgreSQL.
+ */
+export async function flushOutboxToSupabase(
+  ownerId: string,
+  canSyncCloud: boolean
+): Promise<{ syncedCount: number; errorMessage: string | null }> {
+  if (!canSyncCloud || !getAccessToken() || isFlushing) {
+    return { syncedCount: 0, errorMessage: null };
   }
 
-  return Promise.race([
-    commitPromise.then(() => 'synced' as const),
-    new Promise<'queued-offline'>((resolve) =>
-      setTimeout(() => resolve('queued-offline'), 2800)
-    ),
-  ]);
+  isFlushing = true;
+  let syncedCount = 0;
+  let errorMessage: string | null = null;
+
+  try {
+    const queue = await getPendingOutboxForOwner(ownerId);
+    for (const item of queue) {
+      try {
+        if (item.operation === 'CREATE' && item.assetPayload) {
+          await apiCreateAsset(item.assetPayload, item.eventPayload);
+        } else if (item.operation === 'UPDATE' && item.updatesPayload) {
+          await apiUpdateAsset(item.assetId, item.updatesPayload, item.eventPayload);
+        } else if (item.operation === 'DELETE') {
+          await apiDeleteAsset(item.assetId);
+        }
+
+        await removeOutboxItemAndMarkSynced(
+          item.queueId,
+          item.assetId,
+          item.eventPayload?.eventId
+        );
+        syncedCount += 1;
+      } catch (err) {
+        errorMessage =
+          err instanceof Error ? err.message : 'Unable to sync pending changes to Supabase.';
+        break;
+      }
+    }
+  } finally {
+    isFlushing = false;
+    if (syncedCount > 0) {
+      notifyInventoryListeners();
+    }
+  }
+
+  return { syncedCount, errorMessage };
 }
 
-function appendAuditEventToBatch(
-  batch: WriteBatch,
-  params: {
-    assetId: string;
-    ownerId: string;
-    actorEmail: string;
-    action: AssetEventAction;
-    summary: string;
+/**
+ * Syncs outbox first, then pulls authoritative rows from Supabase into IndexedDB.
+ */
+export async function syncInventoryWithSupabase(
+  ownerId: string,
+  canSyncCloud: boolean
+): Promise<{ assets: AssetRecord[]; syncError: string | null }> {
+  let syncError: string | null = null;
+
+  if (canSyncCloud && getAccessToken()) {
+    const flushResult = await flushOutboxToSupabase(ownerId, true);
+    if (flushResult.errorMessage) {
+      syncError = flushResult.errorMessage;
+    }
+
+    try {
+      const remoteAssets = await apiFetchAssets();
+      await reconcileRemoteAssets(ownerId, remoteAssets);
+    } catch (err) {
+      syncError = err instanceof Error ? err.message : 'Unable to fetch Supabase inventory.';
+    }
   }
-) {
-  const eventId = generateSafeId('evt');
-  const eventRef = doc(db, 'assets', params.assetId, 'events', eventId);
-  batch.set(eventRef, {
-    eventId,
-    assetId: params.assetId,
-    ownerId: params.ownerId,
-    action: params.action,
-    summary: params.summary.trim().slice(0, SCHEMA_LIMITS.EVENT_SUMMARY_MAX_LEN),
-    actorEmail: params.actorEmail.trim().slice(0, SCHEMA_LIMITS.ACTOR_EMAIL_MAX_LEN),
-    createdAt: serverTimestamp(),
-  });
+
+  const assets = await getLocalAssetsForOwner(ownerId);
+  return { assets, syncError };
 }
 
-export async function saveUserReportingCurrency(params: {
-  userId: string;
-  reportingCurrency: CurrencyCode;
-  isOnline: boolean;
-}): Promise<void> {
-  if (!isValidCurrencyCode(params.reportingCurrency)) {
-    throw new Error('Unsupported reporting currency.');
+export async function fetchAssetEventsOfflineAware(params: {
+  assetId: string;
+  ownerId: string;
+  canSyncCloud: boolean;
+}): Promise<AssetEventRecord[]> {
+  if (params.canSyncCloud && getAccessToken()) {
+    try {
+      const remoteEvents = await apiFetchAssetEvents(params.assetId);
+      await reconcileRemoteEvents(params.assetId, params.ownerId, remoteEvents);
+    } catch {
+      // Serve cached IndexedDB events seamlessly when offline
+    }
   }
-
-  cacheReportingCurrencyLocally(params.reportingCurrency);
-  const path = `userSettings/${params.userId}`;
-  const writePromise = setDoc(doc(db, 'userSettings', params.userId), {
-    userId: params.userId,
-    reportingCurrency: params.reportingCurrency,
-    updatedAt: serverTimestamp(),
-  }).catch((error) => {
-    handleFirestoreError(error, OperationType.WRITE, path);
-  });
-
-  if (!params.isOnline) {
-    await new Promise((resolve) => setTimeout(resolve, 80));
-    return;
-  }
-
-  await Promise.race([
-    writePromise,
-    new Promise<void>((resolve) => setTimeout(resolve, 2500)),
-  ]);
+  return getLocalEventsForAsset(params.assetId, params.ownerId);
 }
 
 export async function createAssetWithEvent(params: {
   input: AssetFormInput;
   ownerId: string;
   actorEmail: string;
-  isOnline: boolean;
+  canSyncCloud: boolean;
 }): Promise<{ assetId: string; syncState: 'synced' | 'queued-offline' }> {
   const validated = sanitizeAndValidateAssetInput(params.input);
   const assetId = generateSafeId('ast');
-  const assetRef = doc(db, 'assets', assetId);
+  const eventId = generateSafeId('evt');
+  const nowIso = new Date().toISOString();
 
-  const batch = writeBatch(db);
-  batch.set(assetRef, {
+  const storedAsset: StoredAsset = {
     assetId,
     ownerId: params.ownerId,
     ...validated,
-    createdAt: serverTimestamp(),
-    updatedAt: serverTimestamp(),
-  });
+    createdAt: nowIso,
+    updatedAt: nowIso,
+    hasPendingWrites: true,
+  };
 
   const assigneeNote = validated.assignedTo ? ` · Assigned to ${validated.assignedTo}` : '';
-  appendAuditEventToBatch(batch, {
+  const storedEvent: StoredEvent = {
+    eventId,
     assetId,
     ownerId: params.ownerId,
-    actorEmail: params.actorEmail,
     action: 'Asset Registered',
     summary: `Registered in ${validated.category} at ${formatCurrency(
-      validated.currentValuation,
-      validated.currency
-    )} (${validated.currency})${assigneeNote}`,
-  });
+      validated.currentValuation
+    )}${assigneeNote}`.slice(0, SCHEMA_LIMITS.EVENT_SUMMARY_MAX_LEN),
+    actorEmail: params.actorEmail.slice(0, SCHEMA_LIMITS.ACTOR_EMAIL_MAX_LEN),
+    createdAt: nowIso,
+    hasPendingWrites: true,
+  };
 
-  const syncState = await commitBatchOfflineAware(
-    batch,
-    OperationType.CREATE,
-    `assets/${assetId}`,
-    params.isOnline
-  );
-  return { assetId, syncState };
+  const outboxItem: OutboxMutation = {
+    queueId: generateSafeId('q'),
+    ownerId: params.ownerId,
+    operation: 'CREATE',
+    assetId,
+    assetPayload: storedAsset,
+    eventPayload: storedEvent,
+    enqueuedAt: Date.now(),
+  };
+
+  await putLocalAssetAndEvent(storedAsset, storedEvent, outboxItem);
+  notifyInventoryListeners();
+
+  if (params.canSyncCloud && getAccessToken()) {
+    const { errorMessage } = await flushOutboxToSupabase(params.ownerId, true);
+    if (!errorMessage) {
+      return { assetId, syncState: 'synced' };
+    }
+  }
+
+  return { assetId, syncState: 'queued-offline' };
 }
 
 export async function updateFullAssetWithEvent(params: {
@@ -264,33 +301,14 @@ export async function updateFullAssetWithEvent(params: {
   input: AssetFormInput;
   ownerId: string;
   actorEmail: string;
-  isOnline: boolean;
+  canSyncCloud: boolean;
 }): Promise<'synced' | 'queued-offline'> {
   if (params.existing.status === 'Disposed') {
     throw new Error('Disposed assets have finalized lifecycle records and cannot be edited.');
   }
 
   const validated = sanitizeAndValidateAssetInput(params.input);
-  const assetRef = doc(db, 'assets', params.existing.assetId);
-  const batch = writeBatch(db);
-
-  batch.update(assetRef, {
-    name: validated.name,
-    serialNumber: validated.serialNumber,
-    category: validated.category,
-    currency: validated.currency,
-    purchasePrice: validated.purchasePrice,
-    currentValuation: validated.currentValuation,
-    purchaseDate: validated.purchaseDate,
-    warrantyExpiry: validated.warrantyExpiry,
-    status: validated.status,
-    department: validated.department,
-    location: validated.location,
-    assignedTo: validated.assignedTo,
-    notes: validated.notes,
-    photoUrl: validated.photoUrl,
-    updatedAt: serverTimestamp(),
-  });
+  const nowIso = new Date().toISOString();
 
   let action: AssetEventAction = 'Details Updated';
   const changes: string[] = [];
@@ -299,16 +317,12 @@ export async function updateFullAssetWithEvent(params: {
     action = 'Status Changed';
     changes.push(`Status ${params.existing.status} -> ${validated.status}`);
   }
-  if (
-    params.existing.currentValuation !== validated.currentValuation ||
-    params.existing.currency !== validated.currency
-  ) {
+  if (params.existing.currentValuation !== validated.currentValuation) {
     if (action === 'Details Updated') action = 'Valuation Adjusted';
     changes.push(
-      `Valuation ${formatCurrency(
-        params.existing.currentValuation,
-        params.existing.currency
-      )} -> ${formatCurrency(validated.currentValuation, validated.currency)}`
+      `Valuation ${formatCurrency(params.existing.currentValuation)} -> ${formatCurrency(
+        validated.currentValuation
+      )}`
     );
   }
   if (params.existing.photoUrl !== validated.photoUrl) {
@@ -327,20 +341,44 @@ export async function updateFullAssetWithEvent(params: {
     changes.push(`Updated specifications for ${validated.name}`);
   }
 
-  appendAuditEventToBatch(batch, {
+  const updatedAsset: StoredAsset = {
     assetId: params.existing.assetId,
     ownerId: params.ownerId,
-    actorEmail: params.actorEmail,
-    action,
-    summary: changes.join(' · '),
-  });
+    ...validated,
+    createdAt: params.existing.createdAt.toISOString(),
+    updatedAt: nowIso,
+    hasPendingWrites: true,
+  };
 
-  return commitBatchOfflineAware(
-    batch,
-    OperationType.UPDATE,
-    `assets/${params.existing.assetId}`,
-    params.isOnline
-  );
+  const storedEvent: StoredEvent = {
+    eventId: generateSafeId('evt'),
+    assetId: params.existing.assetId,
+    ownerId: params.ownerId,
+    action,
+    summary: changes.join(' · ').slice(0, SCHEMA_LIMITS.EVENT_SUMMARY_MAX_LEN),
+    actorEmail: params.actorEmail.slice(0, SCHEMA_LIMITS.ACTOR_EMAIL_MAX_LEN),
+    createdAt: nowIso,
+    hasPendingWrites: true,
+  };
+
+  const outboxItem: OutboxMutation = {
+    queueId: generateSafeId('q'),
+    ownerId: params.ownerId,
+    operation: 'UPDATE',
+    assetId: params.existing.assetId,
+    updatesPayload: validated,
+    eventPayload: storedEvent,
+    enqueuedAt: Date.now(),
+  };
+
+  await putLocalAssetAndEvent(updatedAsset, storedEvent, outboxItem);
+  notifyInventoryListeners();
+
+  if (params.canSyncCloud && getAccessToken()) {
+    const { errorMessage } = await flushOutboxToSupabase(params.ownerId, true);
+    if (!errorMessage) return 'synced';
+  }
+  return 'queued-offline';
 }
 
 export async function updateAssetStatusAction(params: {
@@ -350,7 +388,7 @@ export async function updateAssetStatusAction(params: {
   location?: string;
   ownerId: string;
   actorEmail: string;
-  isOnline: boolean;
+  canSyncCloud: boolean;
 }): Promise<'synced' | 'queued-offline'> {
   if (params.existing.status === 'Disposed') {
     throw new Error('Disposed assets have finalized lifecycle records and cannot be modified.');
@@ -362,190 +400,239 @@ export async function updateAssetStatusAction(params: {
   const nextLocation = (params.location ?? params.existing.location)
     .trim()
     .slice(0, SCHEMA_LIMITS.LOCATION_MAX_LEN);
-  const safeCurrency: CurrencyCode = isValidCurrencyCode(params.existing.currency)
-    ? params.existing.currency
-    : 'USD';
 
   if (!nextLocation) {
     throw new Error('Location cannot be empty.');
   }
 
-  const assetRef = doc(db, 'assets', params.existing.assetId);
-  const batch = writeBatch(db);
-
-  batch.update(assetRef, {
-    status: params.newStatus,
-    assignedTo: nextAssignedTo,
-    location: nextLocation,
-    currency: safeCurrency,
-    updatedAt: serverTimestamp(),
-  });
-
-  appendAuditEventToBatch(batch, {
+  const nowIso = new Date().toISOString();
+  const updatedAsset: StoredAsset = {
     assetId: params.existing.assetId,
     ownerId: params.ownerId,
-    actorEmail: params.actorEmail,
+    name: params.existing.name,
+    serialNumber: params.existing.serialNumber,
+    category: params.existing.category,
+    purchasePrice: params.existing.purchasePrice,
+    currentValuation: params.existing.currentValuation,
+    purchaseDate: params.existing.purchaseDate,
+    warrantyExpiry: params.existing.warrantyExpiry,
+    status: params.newStatus,
+    department: params.existing.department,
+    location: nextLocation,
+    assignedTo: nextAssignedTo,
+    notes: params.existing.notes,
+    photoUrl: params.existing.photoUrl,
+    createdAt: params.existing.createdAt.toISOString(),
+    updatedAt: nowIso,
+    hasPendingWrites: true,
+  };
+
+  const storedEvent: StoredEvent = {
+    eventId: generateSafeId('evt'),
+    assetId: params.existing.assetId,
+    ownerId: params.ownerId,
     action: 'Status Changed',
     summary: `Lifecycle status changed from ${params.existing.status} to ${params.newStatus}`,
-  });
+    actorEmail: params.actorEmail.slice(0, SCHEMA_LIMITS.ACTOR_EMAIL_MAX_LEN),
+    createdAt: nowIso,
+    hasPendingWrites: true,
+  };
 
-  return commitBatchOfflineAware(
-    batch,
-    OperationType.UPDATE,
-    `assets/${params.existing.assetId}`,
-    params.isOnline
-  );
+  const outboxItem: OutboxMutation = {
+    queueId: generateSafeId('q'),
+    ownerId: params.ownerId,
+    operation: 'UPDATE',
+    assetId: params.existing.assetId,
+    updatesPayload: {
+      status: params.newStatus,
+      assignedTo: nextAssignedTo,
+      location: nextLocation,
+    },
+    eventPayload: storedEvent,
+    enqueuedAt: Date.now(),
+  };
+
+  await putLocalAssetAndEvent(updatedAsset, storedEvent, outboxItem);
+  notifyInventoryListeners();
+
+  if (params.canSyncCloud && getAccessToken()) {
+    const { errorMessage } = await flushOutboxToSupabase(params.ownerId, true);
+    if (!errorMessage) return 'synced';
+  }
+  return 'queued-offline';
 }
 
 export async function updateAssetValuationAction(params: {
   existing: AssetRecord;
   newValuation: number;
-  newCurrency?: CurrencyCode;
   notes?: string;
   ownerId: string;
   actorEmail: string;
-  isOnline: boolean;
+  canSyncCloud: boolean;
 }): Promise<'synced' | 'queued-offline'> {
   if (params.existing.status === 'Disposed') {
     throw new Error('Disposed assets have finalized lifecycle records and cannot be revalued.');
   }
 
-  const targetCurrency: CurrencyCode =
-    params.newCurrency && isValidCurrencyCode(params.newCurrency)
-      ? params.newCurrency
-      : isValidCurrencyCode(params.existing.currency)
-      ? params.existing.currency
-      : 'USD';
-
-  const isZeroDec = Boolean(CURRENCY_META[targetCurrency].zeroDecimal);
-  const cleanVal = isZeroDec
-    ? Math.round(Number(params.newValuation))
-    : Math.round(Number(params.newValuation) * 100) / 100;
-
+  const cleanVal = Math.round(Number(params.newValuation) * 100) / 100;
   if (
     !Number.isFinite(cleanVal) ||
     cleanVal < 0 ||
     cleanVal > SCHEMA_LIMITS.MAX_MONETARY_VALUE
   ) {
-    throw new Error('Valuation must be between 0 and 1,000,000,000.');
+    throw new Error('Valuation must be between $0 and $1,000,000,000.');
   }
 
   const nextNotes = (params.notes ?? params.existing.notes)
     .trim()
     .slice(0, SCHEMA_LIMITS.NOTES_MAX_LEN);
 
-  const assetRef = doc(db, 'assets', params.existing.assetId);
-  const batch = writeBatch(db);
-
-  batch.update(assetRef, {
-    currentValuation: cleanVal,
-    currency: targetCurrency,
-    notes: nextNotes,
-    updatedAt: serverTimestamp(),
-  });
-
-  appendAuditEventToBatch(batch, {
+  const nowIso = new Date().toISOString();
+  const updatedAsset: StoredAsset = {
     assetId: params.existing.assetId,
     ownerId: params.ownerId,
-    actorEmail: params.actorEmail,
+    name: params.existing.name,
+    serialNumber: params.existing.serialNumber,
+    category: params.existing.category,
+    purchasePrice: params.existing.purchasePrice,
+    currentValuation: cleanVal,
+    purchaseDate: params.existing.purchaseDate,
+    warrantyExpiry: params.existing.warrantyExpiry,
+    status: params.existing.status,
+    department: params.existing.department,
+    location: params.existing.location,
+    assignedTo: params.existing.assignedTo,
+    notes: nextNotes,
+    photoUrl: params.existing.photoUrl,
+    createdAt: params.existing.createdAt.toISOString(),
+    updatedAt: nowIso,
+    hasPendingWrites: true,
+  };
+
+  const storedEvent: StoredEvent = {
+    eventId: generateSafeId('evt'),
+    assetId: params.existing.assetId,
+    ownerId: params.ownerId,
     action: 'Valuation Adjusted',
     summary: `Book valuation updated from ${formatCurrency(
-      params.existing.currentValuation,
-      params.existing.currency
-    )} to ${formatCurrency(cleanVal, targetCurrency)} (${targetCurrency})`,
-  });
+      params.existing.currentValuation
+    )} to ${formatCurrency(cleanVal)}`,
+    actorEmail: params.actorEmail.slice(0, SCHEMA_LIMITS.ACTOR_EMAIL_MAX_LEN),
+    createdAt: nowIso,
+    hasPendingWrites: true,
+  };
 
-  return commitBatchOfflineAware(
-    batch,
-    OperationType.UPDATE,
-    `assets/${params.existing.assetId}`,
-    params.isOnline
-  );
+  const outboxItem: OutboxMutation = {
+    queueId: generateSafeId('q'),
+    ownerId: params.ownerId,
+    operation: 'UPDATE',
+    assetId: params.existing.assetId,
+    updatesPayload: {
+      currentValuation: cleanVal,
+      notes: nextNotes,
+    },
+    eventPayload: storedEvent,
+    enqueuedAt: Date.now(),
+  };
+
+  await putLocalAssetAndEvent(updatedAsset, storedEvent, outboxItem);
+  notifyInventoryListeners();
+
+  if (params.canSyncCloud && getAccessToken()) {
+    const { errorMessage } = await flushOutboxToSupabase(params.ownerId, true);
+    if (!errorMessage) return 'synced';
+  }
+  return 'queued-offline';
 }
 
 export async function deleteAssetWithEvents(params: {
   assetId: string;
   ownerId: string;
-  isOnline: boolean;
+  canSyncCloud: boolean;
 }): Promise<'synced' | 'queued-offline'> {
-  const eventsPath = `assets/${params.assetId}/events`;
-  const batch = writeBatch(db);
+  const outboxItem: OutboxMutation = {
+    queueId: generateSafeId('q'),
+    ownerId: params.ownerId,
+    operation: 'DELETE',
+    assetId: params.assetId,
+    enqueuedAt: Date.now(),
+  };
 
-  try {
-    const eventsQuery = query(
-      collection(db, 'assets', params.assetId, 'events'),
-      where('ownerId', '==', params.ownerId)
-    );
-    const eventsSnap = await getDocs(eventsQuery);
-    eventsSnap.docs.forEach((eventDoc) => {
-      batch.delete(eventDoc.ref);
-    });
-  } catch (error) {
-    handleFirestoreError(error, OperationType.LIST, eventsPath);
+  await deleteLocalAssetAndEnqueue(params.assetId, outboxItem);
+  notifyInventoryListeners();
+
+  if (params.canSyncCloud && getAccessToken()) {
+    const { errorMessage } = await flushOutboxToSupabase(params.ownerId, true);
+    if (!errorMessage) return 'synced';
   }
-
-  batch.delete(doc(db, 'assets', params.assetId));
-  return commitBatchOfflineAware(
-    batch,
-    OperationType.DELETE,
-    `assets/${params.assetId}`,
-    params.isOnline
-  );
+  return 'queued-offline';
 }
 
 export async function seedSampleAssets(params: {
   ownerId: string;
   actorEmail: string;
-  isOnline: boolean;
+  canSyncCloud: boolean;
 }): Promise<'synced' | 'queued-offline'> {
-  const batch = writeBatch(db);
-
   for (const sample of SAMPLE_STARTER_ASSETS) {
     const validated = sanitizeAndValidateAssetInput(sample);
     const assetId = generateSafeId('ast');
-    const assetRef = doc(db, 'assets', assetId);
+    const eventId = generateSafeId('evt');
+    const nowIso = new Date().toISOString();
 
-    batch.set(assetRef, {
+    const storedAsset: StoredAsset = {
       assetId,
       ownerId: params.ownerId,
       ...validated,
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-    });
+      createdAt: nowIso,
+      updatedAt: nowIso,
+      hasPendingWrites: true,
+    };
 
-    appendAuditEventToBatch(batch, {
+    const storedEvent: StoredEvent = {
+      eventId,
       assetId,
       ownerId: params.ownerId,
-      actorEmail: params.actorEmail,
       action: 'Asset Registered',
       summary: `Initial catalog registration in ${validated.category} (${formatCurrency(
-        validated.currentValuation,
-        validated.currency
-      )} ${validated.currency})`,
-    });
+        validated.currentValuation
+      )})`,
+      actorEmail: params.actorEmail.slice(0, SCHEMA_LIMITS.ACTOR_EMAIL_MAX_LEN),
+      createdAt: nowIso,
+      hasPendingWrites: true,
+    };
+
+    const outboxItem: OutboxMutation = {
+      queueId: generateSafeId('q'),
+      ownerId: params.ownerId,
+      operation: 'CREATE',
+      assetId,
+      assetPayload: storedAsset,
+      eventPayload: storedEvent,
+      enqueuedAt: Date.now(),
+    };
+
+    await putLocalAssetAndEvent(storedAsset, storedEvent, outboxItem);
   }
 
-  return commitBatchOfflineAware(batch, OperationType.CREATE, 'assets', params.isOnline);
+  notifyInventoryListeners();
+
+  if (params.canSyncCloud && getAccessToken()) {
+    const { errorMessage } = await flushOutboxToSupabase(params.ownerId, true);
+    if (!errorMessage) return 'synced';
+  }
+  return 'queued-offline';
 }
 
-export function exportAssetsToCsv(
-  assets: AssetRecord[],
-  reportingCurrency: CurrencyCode,
-  usdRates: Record<CurrencyCode, number>
-): void {
+export function exportAssetsToCsv(assets: AssetRecord[]): void {
   const headers = [
     'Asset ID',
     'Asset Name',
     'Serial / Model Number',
     'Category',
     'Status',
-    'Native Currency',
-    'Purchase Price (Native)',
-    'Current Valuation (Native)',
-    `Reporting Currency (${reportingCurrency})`,
-    'FX Conversion Rate',
-    `Converted Purchase (${reportingCurrency})`,
-    `Converted Valuation (${reportingCurrency})`,
+    'Purchase Price (USD)',
+    'Current Valuation (USD)',
+    'Net Depreciation (USD)',
     'Purchase Date',
     'Warranty Expiry',
     'Department',
@@ -565,35 +652,16 @@ export function exportAssetsToCsv(
   };
 
   const rows = assets.map((asset) => {
-    const fxRate = getCrossRate(asset.currency, reportingCurrency, usdRates);
-    const convertedPurchase = convertCurrency(
-      asset.purchasePrice,
-      asset.currency,
-      reportingCurrency,
-      usdRates
-    );
-    const convertedValuation = convertCurrency(
-      asset.currentValuation,
-      asset.currency,
-      reportingCurrency,
-      usdRates
-    );
-    const nativeDecimals = CURRENCY_META[asset.currency]?.zeroDecimal ? 0 : 2;
-    const reportDecimals = CURRENCY_META[reportingCurrency]?.zeroDecimal ? 0 : 2;
-
+    const depreciation = Math.round((asset.currentValuation - asset.purchasePrice) * 100) / 100;
     return [
       asset.assetId,
       asset.name,
       asset.serialNumber,
       asset.category,
       asset.status,
-      asset.currency,
-      asset.purchasePrice.toFixed(nativeDecimals),
-      asset.currentValuation.toFixed(nativeDecimals),
-      reportingCurrency,
-      fxRate.toFixed(4),
-      convertedPurchase.toFixed(reportDecimals),
-      convertedValuation.toFixed(reportDecimals),
+      asset.purchasePrice.toFixed(2),
+      asset.currentValuation.toFixed(2),
+      depreciation.toFixed(2),
       asset.purchaseDate,
       asset.warrantyExpiry || 'N/A',
       asset.department,
@@ -613,10 +681,7 @@ export function exportAssetsToCsv(
   const link = document.createElement('a');
   const dateStamp = new Date().toISOString().slice(0, 10);
   link.href = url;
-  link.setAttribute(
-    'download',
-    `asset-track-inventory-${reportingCurrency.toLowerCase()}-${dateStamp}.csv`
-  );
+  link.setAttribute('download', `asset-track-inventory-${dateStamp}.csv`);
   document.body.appendChild(link);
   link.click();
   document.body.removeChild(link);

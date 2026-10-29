@@ -4,49 +4,30 @@
  */
 
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { onAuthStateChanged, signInWithPopup, signOut, User } from 'firebase/auth';
-import {
-  collection,
-  doc,
-  onSnapshot,
-  query,
-  Timestamp,
-  where,
-} from 'firebase/firestore';
 import {
   BarChart3,
   Boxes,
   CheckCircle2,
   CloudOff,
-  Globe,
+  HardDrive,
   LayoutDashboard,
   LogIn,
   LogOut,
   QrCode,
   RefreshCw,
   ShieldCheck,
+  UserPlus,
   Wifi,
   WifiOff,
 } from 'lucide-react';
+import { getLocalAssetsForOwner } from './lib/offlineDb';
 import {
-  auth,
-  db,
-  googleProvider,
-  handleFirestoreError,
-  OperationType,
-  setFirestoreNetworkEnabled,
-} from './lib/firebase';
-import {
-  cacheReportingCurrencyLocally,
-  CURRENCY_META,
-  CurrencyCode,
-  fetchLiveFxRates,
-  FxRatesSnapshot,
-  isValidCurrencyCode,
-  loadCachedReportingCurrency,
-  loadInitialFxRates,
-  SUPPORTED_CURRENCIES,
-} from './lib/currency';
+  fetchSupabaseConfigStatus,
+  setSupabaseTokens,
+  signInWithSupabase,
+  signUpWithSupabase,
+  SupabaseSessionUser,
+} from './lib/supabaseApi';
 import {
   AssetCategory,
   AssetFormInput,
@@ -57,8 +38,9 @@ import {
   createAssetWithEvent,
   deleteAssetWithEvents,
   exportAssetsToCsv,
-  saveUserReportingCurrency,
   seedSampleAssets,
+  subscribeToInventoryChanges,
+  syncInventoryWithSupabase,
   updateAssetStatusAction,
   updateAssetValuationAction,
   updateFullAssetWithEvent,
@@ -73,33 +55,39 @@ import { QrScannerModal } from './components/QrScannerModal';
 
 type ActiveTab = 'dashboard' | 'inventory' | 'reports';
 
+const LOCAL_WORKSPACE_USER: SupabaseSessionUser = {
+  id: 'local_offline_workspace',
+  email: 'offline@local.workspace',
+  isLocalOnly: true,
+};
+
 function AssetTrackWorkspace() {
-  const [user, setUser] = useState<User | null>(null);
-  const [authReady, setAuthReady] = useState(false);
+  const [supabaseConfigured, setSupabaseConfigured] = useState<boolean>(false);
+  const [configChecked, setConfigChecked] = useState<boolean>(false);
+
+  const [user, setUser] = useState<SupabaseSessionUser | null>(null);
+  const [authMode, setAuthMode] = useState<'login' | 'signup'>('login');
+  const [emailInput, setEmailInput] = useState('');
+  const [passwordInput, setPasswordInput] = useState('');
   const [authError, setAuthError] = useState<string | null>(null);
-  const [isSigningIn, setIsSigningIn] = useState(false);
+  const [authInfoMessage, setAuthInfoMessage] = useState<string | null>(null);
+  const [isAuthenticating, setIsAuthenticating] = useState(false);
 
   const [activeTab, setActiveTab] = useState<ActiveTab>('dashboard');
   const [filterCategory, setFilterCategory] = useState<AssetCategory | 'All'>('All');
   const [filterStatus, setFilterStatus] = useState<AssetStatus | 'All'>('All');
 
   const [assets, setAssets] = useState<AssetRecord[]>([]);
-  const [loadingAssets, setLoadingAssets] = useState(true);
+  const [loadingAssets, setLoadingAssets] = useState(false);
   const [isSeeding, setIsSeeding] = useState(false);
+  const [isSyncing, setIsSyncing] = useState(false);
+  const [syncWarning, setSyncWarning] = useState<string | null>(null);
 
-  // Multicurrency Portfolio Reporting State + Live/Offline FX Rates
-  const [reportingCurrency, setReportingCurrency] = useState<CurrencyCode>(() =>
-    loadCachedReportingCurrency()
-  );
-  const [fxSnapshot, setFxSnapshot] = useState<FxRatesSnapshot>(() => loadInitialFxRates());
-  const [isRefreshingFx, setIsRefreshingFx] = useState(false);
-
-  // Real-time connectivity + Offline simulation state
+  // Connectivity & Offline Simulation
   const [browserOnline, setBrowserOnline] = useState<boolean>(() =>
     typeof navigator !== 'undefined' ? navigator.onLine : true
   );
   const [simulatedOffline, setSimulatedOffline] = useState(false);
-  const [togglingNetwork, setTogglingNetwork] = useState(false);
 
   // Modals
   const [isFormOpen, setIsFormOpen] = useState(false);
@@ -112,29 +100,9 @@ function AssetTrackWorkspace() {
   const [toastMessage, setToastMessage] = useState<string | null>(null);
 
   const effectiveOnline = browserOnline && !simulatedOffline;
-
-  const refreshExchangeRates = useCallback(async (showToast = false) => {
-    setIsRefreshingFx(true);
-    try {
-      const latest = await fetchLiveFxRates();
-      setFxSnapshot(latest);
-      if (showToast) {
-        setToastMessage('Updated live market FX exchange rates');
-      }
-    } catch {
-      if (showToast) {
-        setToastMessage('Using cached FX rates · Live rate service unreachable');
-      }
-    } finally {
-      setIsRefreshingFx(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    if (effectiveOnline) {
-      void refreshExchangeRates(false);
-    }
-  }, [effectiveOnline, refreshExchangeRates]);
+  const canSyncCloud = Boolean(
+    effectiveOnline && supabaseConfigured && user && !user.isLocalOnly
+  );
 
   useEffect(() => {
     const handleOnline = () => setBrowserOnline(true);
@@ -148,97 +116,60 @@ function AssetTrackWorkspace() {
   }, []);
 
   useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
-      setUser(currentUser);
-      setAuthReady(true);
+    let active = true;
+    void fetchSupabaseConfigStatus().then((configured) => {
+      if (!active) return;
+      setSupabaseConfigured(configured);
+      setConfigChecked(true);
     });
-    return () => unsubscribe();
+    return () => {
+      active = false;
+    };
   }, []);
 
-  // Subscribe to user reporting currency preference in Firestore
-  useEffect(() => {
-    if (!authReady || !user) return;
-    const settingsPath = `userSettings/${user.uid}`;
-    const unsubscribe = onSnapshot(
-      doc(db, 'userSettings', user.uid),
-      (docSnap) => {
-        if (docSnap.exists()) {
-          const data = docSnap.data();
-          if (isValidCurrencyCode(data.reportingCurrency)) {
-            setReportingCurrency(data.reportingCurrency);
-            cacheReportingCurrencyLocally(data.reportingCurrency);
-          }
-        }
-      },
-      (error) => {
-        handleFirestoreError(error, OperationType.GET, settingsPath);
-      }
-    );
-    return () => unsubscribe();
-  }, [authReady, user]);
+  const refreshLocalView = useCallback(async () => {
+    if (!user) return;
+    const localList = await getLocalAssetsForOwner(user.id);
+    setAssets(localList);
+  }, [user]);
 
-  // Subscribe to user assets in Firestore
+  const runFullCloudSync = useCallback(async () => {
+    if (!user) return;
+    setIsSyncing(true);
+    try {
+      const { assets: updatedList, syncError } = await syncInventoryWithSupabase(
+        user.id,
+        canSyncCloud
+      );
+      setAssets(updatedList);
+      setSyncWarning(syncError);
+    } finally {
+      setIsSyncing(false);
+      setLoadingAssets(false);
+    }
+  }, [user, canSyncCloud]);
+
+  // Subscribe to immediate IndexedDB mutations
   useEffect(() => {
-    if (!authReady) return;
     if (!user) {
       setAssets([]);
-      setLoadingAssets(false);
       return;
     }
-
     setLoadingAssets(true);
-    const assetsPath = 'assets';
-    const q = query(collection(db, assetsPath), where('ownerId', '==', user.uid));
+    void runFullCloudSync();
 
-    const unsubscribe = onSnapshot(
-      q,
-      { includeMetadataChanges: true },
-      (snapshot) => {
-        const mapped: AssetRecord[] = snapshot.docs.map((docSnap) => {
-          const data = docSnap.data({ serverTimestamps: 'estimate' });
-          const createdAt =
-            data.createdAt instanceof Timestamp ? data.createdAt.toDate() : new Date();
-          const updatedAt =
-            data.updatedAt instanceof Timestamp ? data.updatedAt.toDate() : new Date();
-          const ccy: CurrencyCode = isValidCurrencyCode(data.currency)
-            ? data.currency
-            : 'USD';
-
-          return {
-            assetId: String(data.assetId || docSnap.id),
-            ownerId: String(data.ownerId || user.uid),
-            name: String(data.name || ''),
-            serialNumber: String(data.serialNumber || ''),
-            category: (data.category as AssetCategory) || 'Other',
-            currency: ccy,
-            purchasePrice: Number(data.purchasePrice || 0),
-            currentValuation: Number(data.currentValuation || 0),
-            purchaseDate: String(data.purchaseDate || ''),
-            warrantyExpiry: String(data.warrantyExpiry || ''),
-            status: (data.status as AssetStatus) || 'Available',
-            department: String(data.department || ''),
-            location: String(data.location || ''),
-            assignedTo: String(data.assignedTo || ''),
-            notes: String(data.notes || ''),
-            photoUrl: String(data.photoUrl || ''),
-            createdAt,
-            updatedAt,
-            hasPendingWrites: docSnap.metadata.hasPendingWrites,
-          };
-        });
-
-        mapped.sort((a, b) => b.updatedAt.getTime() - a.updatedAt.getTime());
-        setAssets(mapped);
-        setLoadingAssets(false);
-      },
-      (error) => {
-        setLoadingAssets(false);
-        handleFirestoreError(error, OperationType.LIST, assetsPath);
-      }
-    );
-
+    const unsubscribe = subscribeToInventoryChanges(() => {
+      void refreshLocalView();
+    });
     return () => unsubscribe();
-  }, [authReady, user]);
+  }, [user, runFullCloudSync, refreshLocalView]);
+
+  // Auto-sync when network reconnects
+  useEffect(() => {
+    if (canSyncCloud && user) {
+      void runFullCloudSync();
+    }
+  }, [canSyncCloud, user, runFullCloudSync]);
 
   useEffect(() => {
     if (!toastMessage) return;
@@ -256,56 +187,57 @@ function AssetTrackWorkspace() {
     [assets, selectedAssetId]
   );
 
-  const handleReportingCurrencyChange = async (nextCurrency: CurrencyCode) => {
-    setReportingCurrency(nextCurrency);
-    cacheReportingCurrencyLocally(nextCurrency);
-    if (user) {
-      await saveUserReportingCurrency({
-        userId: user.uid,
-        reportingCurrency: nextCurrency,
-        isOnline: effectiveOnline,
-      });
-    }
-    setToastMessage(`Portfolio reporting currency set to ${nextCurrency}`);
-  };
-
-  const handleGoogleSignIn = async () => {
+  const handleSupabaseAuthSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
     setAuthError(null);
-    setIsSigningIn(true);
+    setAuthInfoMessage(null);
+    setIsAuthenticating(true);
+
     try {
-      await signInWithPopup(auth, googleProvider);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Sign-in cancelled or failed.';
-      if (!msg.includes('auth/popup-closed-by-user')) {
-        setAuthError(msg);
+      if (authMode === 'login') {
+        const loggedInUser = await signInWithSupabase(emailInput, passwordInput);
+        setUser(loggedInUser);
+        setPasswordInput('');
+      } else {
+        const result = await signUpWithSupabase(emailInput, passwordInput);
+        if (result.user) {
+          setUser(result.user);
+          setPasswordInput('');
+        } else if (result.confirmationRequired) {
+          setAuthInfoMessage(
+            result.message || 'Check your email inbox to confirm your account, then sign in.'
+          );
+          setAuthMode('login');
+        }
       }
+    } catch (err) {
+      setAuthError(err instanceof Error ? err.message : 'Authentication failed.');
     } finally {
-      setIsSigningIn(false);
+      setIsAuthenticating(false);
     }
   };
 
-  const handleSignOut = async () => {
-    if (simulatedOffline) {
-      await setFirestoreNetworkEnabled(true);
-      setSimulatedOffline(false);
-    }
-    await signOut(auth);
+  const handleEnterOfflineWorkspace = () => {
+    setAuthError(null);
+    setSyncWarning(null);
+    setUser(LOCAL_WORKSPACE_USER);
   };
 
-  const handleToggleOfflineSimulation = async () => {
-    setTogglingNetwork(true);
-    try {
-      const nextOffline = !simulatedOffline;
-      await setFirestoreNetworkEnabled(!nextOffline);
-      setSimulatedOffline(nextOffline);
-      setToastMessage(
-        nextOffline
-          ? 'Offline mode active · Edits save to local IndexedDB cache'
-          : 'Reconnected · Auto-syncing local queue to Cloud Firestore'
-      );
-    } finally {
-      setTogglingNetwork(false);
-    }
+  const handleSignOut = () => {
+    setSupabaseTokens(null, null);
+    setSimulatedOffline(false);
+    setSyncWarning(null);
+    setUser(null);
+  };
+
+  const handleToggleOfflineSimulation = () => {
+    const nextOffline = !simulatedOffline;
+    setSimulatedOffline(nextOffline);
+    setToastMessage(
+      nextOffline
+        ? 'Offline mode active · Edits save to IndexedDB cache'
+        : 'Reconnected · Auto-syncing local queue to Supabase'
+    );
   };
 
   const openNewAssetModal = (serial = '') => {
@@ -322,46 +254,46 @@ function AssetTrackWorkspace() {
   };
 
   const handleFormSave = async (input: AssetFormInput) => {
-    if (!user || !user.email) {
-      throw new Error('Verified Google account required to save inventory.');
+    if (!user) {
+      throw new Error('Sign in required to save inventory.');
     }
 
     if (editingAsset) {
       const state = await updateFullAssetWithEvent({
         existing: editingAsset,
         input,
-        ownerId: user.uid,
+        ownerId: user.id,
         actorEmail: user.email,
-        isOnline: effectiveOnline,
+        canSyncCloud,
       });
       setToastMessage(
         state === 'queued-offline'
-          ? 'Saved locally · Will sync automatically when online'
-          : 'Asset changes synced to Cloud Firestore'
+          ? 'Saved locally · Queued for Supabase sync'
+          : 'Asset changes synced to Supabase'
       );
     } else {
       const { syncState } = await createAssetWithEvent({
         input,
-        ownerId: user.uid,
+        ownerId: user.id,
         actorEmail: user.email,
-        isOnline: effectiveOnline,
+        canSyncCloud,
       });
       setToastMessage(
         syncState === 'queued-offline'
-          ? 'Asset saved locally · Queued for background sync'
-          : `New asset registered in ${input.currency}`
+          ? 'Asset saved locally · Queued for Supabase sync'
+          : 'New asset registered in Supabase'
       );
     }
   };
 
   const handleQuickStatusUpdate = async (asset: AssetRecord, nextStatus: AssetStatus) => {
-    if (!user || !user.email) return;
+    if (!user) return;
     const syncState = await updateAssetStatusAction({
       existing: asset,
       newStatus: nextStatus,
-      ownerId: user.uid,
+      ownerId: user.id,
       actorEmail: user.email,
-      isOnline: effectiveOnline,
+      canSyncCloud,
     });
     setToastMessage(
       syncState === 'queued-offline'
@@ -370,24 +302,19 @@ function AssetTrackWorkspace() {
     );
   };
 
-  const handleQuickValuationUpdate = async (
-    asset: AssetRecord,
-    nextValuation: number,
-    nextCurrency: CurrencyCode
-  ) => {
-    if (!user || !user.email) return;
+  const handleQuickValuationUpdate = async (asset: AssetRecord, nextValuation: number) => {
+    if (!user) return;
     const syncState = await updateAssetValuationAction({
       existing: asset,
       newValuation: nextValuation,
-      newCurrency: nextCurrency,
-      ownerId: user.uid,
+      ownerId: user.id,
       actorEmail: user.email,
-      isOnline: effectiveOnline,
+      canSyncCloud,
     });
     setToastMessage(
       syncState === 'queued-offline'
         ? 'Valuation saved locally · Pending sync'
-        : `Valuation updated in ${nextCurrency}`
+        : 'Valuation updated in Supabase'
     );
   };
 
@@ -395,29 +322,29 @@ function AssetTrackWorkspace() {
     if (!user) return;
     const syncState = await deleteAssetWithEvents({
       assetId,
-      ownerId: user.uid,
-      isOnline: effectiveOnline,
+      ownerId: user.id,
+      canSyncCloud,
     });
     setToastMessage(
       syncState === 'queued-offline'
         ? 'Deletion queued locally'
-        : 'Asset record deleted'
+        : 'Asset record deleted from Supabase'
     );
   };
 
   const handleSeedSamples = async () => {
-    if (!user || !user.email) return;
+    if (!user) return;
     setIsSeeding(true);
     try {
       const syncState = await seedSampleAssets({
-        ownerId: user.uid,
+        ownerId: user.id,
         actorEmail: user.email,
-        isOnline: effectiveOnline,
+        canSyncCloud,
       });
       setToastMessage(
         syncState === 'queued-offline'
-          ? 'Multicurrency sample catalog saved locally'
-          : 'Loaded sample catalog (USD, EUR, GBP)'
+          ? 'Sample catalog saved locally'
+          : 'Sample corporate inventory synced to Supabase'
       );
     } finally {
       setIsSeeding(false);
@@ -425,8 +352,8 @@ function AssetTrackWorkspace() {
   };
 
   const handleExportCsv = () => {
-    exportAssetsToCsv(assets, reportingCurrency, fxSnapshot.usdRates);
-    setToastMessage(`Exported multicurrency CSV ledger (${reportingCurrency})`);
+    exportAssetsToCsv(assets);
+    setToastMessage('Exported inventory CSV ledger');
   };
 
   return (
@@ -531,23 +458,22 @@ function AssetTrackWorkspace() {
           ) : (
             <button
               type="button"
-              disabled={isSigningIn || !authReady}
-              onClick={() => void handleGoogleSignIn()}
-              className="min-h-[38px] px-4 py-2 text-xs font-semibold text-white bg-slate-900 hover:bg-slate-800 disabled:opacity-50 rounded-xl transition-colors whitespace-nowrap shrink-0"
+              onClick={handleEnterOfflineWorkspace}
+              className="min-h-[38px] px-4 py-2 text-xs font-semibold text-white bg-slate-900 hover:bg-slate-800 rounded-xl transition-colors whitespace-nowrap shrink-0"
             >
-              {isSigningIn ? 'Signing In...' : 'Sign In'}
+              Open Workspace
             </button>
           )}
         </div>
       </header>
 
-      {/* Workspace Sync, Multicurrency Base Selector & Account Toolbar */}
+      {/* Workspace Sync & Account Toolbar (Only when active workspace is open) */}
       {user && (
         <div className="bg-white border-b border-slate-200 px-4 sm:px-6 lg:px-8 py-2.5">
           <div className="max-w-7xl mx-auto flex flex-wrap items-center justify-between gap-3 text-xs">
-            {/* Left: Sync Status + Offline Toggle + Portfolio Currency Selector */}
+            {/* Visual Offline-First & Real-Time Sync Status Indicator */}
             <div className="flex flex-wrap items-center gap-3">
-              {!effectiveOnline ? (
+              {!effectiveOnline || user.isLocalOnly ? (
                 <div className="inline-flex items-center gap-1.5 font-medium text-amber-800">
                   <WifiOff className="w-4 h-4 text-amber-600 shrink-0" />
                   <span>
@@ -555,10 +481,12 @@ function AssetTrackWorkspace() {
                     {pendingWritesCount > 0 ? ` (${pendingWritesCount} queued)` : ''}
                   </span>
                 </div>
-              ) : pendingWritesCount > 0 ? (
+              ) : isSyncing || pendingWritesCount > 0 ? (
                 <div className="inline-flex items-center gap-1.5 font-medium text-blue-700">
                   <RefreshCw className="w-4 h-4 animate-spin shrink-0" />
-                  <span>Syncing {pendingWritesCount} local changes...</span>
+                  <span>
+                    Syncing {pendingWritesCount > 0 ? `${pendingWritesCount} changes` : 'Supabase'}...
+                  </span>
                 </div>
               ) : (
                 <div className="inline-flex items-center gap-1.5 font-medium text-emerald-700">
@@ -567,69 +495,45 @@ function AssetTrackWorkspace() {
                 </div>
               )}
 
-              <span aria-hidden="true" className="text-slate-300">
-                |
-              </span>
+              {!user.isLocalOnly && (
+                <>
+                  <span aria-hidden="true" className="text-slate-300">
+                    |
+                  </span>
 
-              {/* Consolidated Portfolio Currency Selector */}
-              <div className="inline-flex items-center gap-1.5">
-                <Globe className="w-3.5 h-3.5 text-slate-500 shrink-0" />
-                <label htmlFor="reporting-currency-select" className="text-slate-600 hidden sm:inline">
-                  Portfolio:
-                </label>
-                <select
-                  id="reporting-currency-select"
-                  value={reportingCurrency}
-                  onChange={(e) =>
-                    void handleReportingCurrencyChange(e.target.value as CurrencyCode)
-                  }
-                  aria-label="Consolidated portfolio reporting currency"
-                  className="min-h-[32px] px-2 py-1 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-900 font-mono font-semibold focus:outline-none focus:ring-2 focus:ring-blue-600"
-                >
-                  {SUPPORTED_CURRENCIES.map((code) => (
-                    <option key={code} value={code}>
-                      {code} ({CURRENCY_META[code].symbol})
-                    </option>
-                  ))}
-                </select>
-              </div>
-
-              <span aria-hidden="true" className="text-slate-300">
-                |
-              </span>
-
-              <button
-                type="button"
-                disabled={togglingNetwork}
-                onClick={() => void handleToggleOfflineSimulation()}
-                className="min-h-[32px] px-2.5 py-1 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 font-medium transition-colors inline-flex items-center gap-1.5 whitespace-nowrap"
-              >
-                {simulatedOffline ? (
-                  <>
-                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
-                    <span>Reconnect Cloud</span>
-                  </>
-                ) : (
-                  <>
-                    <CloudOff className="w-3.5 h-3.5 text-slate-500" />
-                    <span>Test Offline Mode</span>
-                  </>
-                )}
-              </button>
+                  <button
+                    type="button"
+                    onClick={handleToggleOfflineSimulation}
+                    className="min-h-[32px] px-2.5 py-1 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 font-medium transition-colors inline-flex items-center gap-1.5 whitespace-nowrap"
+                  >
+                    {simulatedOffline ? (
+                      <>
+                        <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
+                        <span>Reconnect Cloud</span>
+                      </>
+                    ) : (
+                      <>
+                        <CloudOff className="w-3.5 h-3.5 text-slate-500" />
+                        <span>Test Offline Mode</span>
+                      </>
+                    )}
+                  </button>
+                </>
+              )}
             </div>
 
-            {/* Right: Authenticated User & Sign Out */}
+            {/* Authenticated User & Sign Out */}
             <div className="flex items-center gap-3 text-slate-600">
-              <span className="hidden lg:inline truncate max-w-[220px]">
-                {user.email}
+              <span className="hidden sm:inline truncate max-w-[220px]">
+                {user.isLocalOnly ? 'Local Offline Cache' : user.email}
               </span>
               <button
                 type="button"
-                onClick={() => void handleSignOut()}
+                onClick={handleSignOut}
                 className="min-h-[32px] px-2.5 py-1 rounded-lg hover:bg-slate-100 text-slate-700 font-medium transition-colors inline-flex items-center gap-1.5 whitespace-nowrap"
               >
                 <LogOut className="w-3.5 h-3.5" />
-                <span>Sign Out</span>
+                <span>{user.isLocalOnly ? 'Switch Account' : 'Sign Out'}</span>
               </button>
             </div>
           </div>
@@ -638,103 +542,214 @@ function AssetTrackWorkspace() {
 
       {/* Main Content Viewport */}
       <main className="flex-1 w-full max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 sm:py-8 pb-24 md:pb-12">
-        {!authReady ? (
+        {!configChecked ? (
           <div className="py-20 flex flex-col items-center justify-center gap-3 text-slate-500">
             <RefreshCw className="w-6 h-6 animate-spin" />
-            <span className="text-sm">Initializing offline-first database...</span>
+            <span className="text-sm">Initializing workspace...</span>
           </div>
         ) : !user ? (
-          /* Corporate Sign-In & Overview Landing */
-          <div className="py-6 sm:py-12 space-y-16">
-            <section className="grid grid-cols-1 lg:grid-cols-12 gap-10 items-center">
+          /* Corporate Sign-In & Supabase Overview Landing */
+          <div className="py-6 sm:py-10 space-y-12">
+            <section className="grid grid-cols-1 lg:grid-cols-12 gap-10 items-start">
               <div className="lg:col-span-7 space-y-6">
                 <p className="text-xs font-semibold text-blue-600">
-                  Multicurrency Corporate Capital & Equipment Registry
+                  Corporate Capital & Equipment Registry · Powered by Supabase
                 </p>
                 <h1
                   className="text-3xl sm:text-5xl font-bold tracking-tight text-slate-900 leading-[1.12]"
                   style={{ textWrap: 'balance' }}
                 >
-                  Track every physical asset, global currency valuation, and custody handoff—online or offline.
+                  Track every physical asset, valuation, and custody handoff—online or offline.
                 </h1>
                 <p className="text-base text-slate-600 leading-relaxed max-w-2xl">
                   Built for medium-sized operations teams managing IT workstations, fleet
-                  vehicles, office furnishings, and industrial machinery across 12 global
-                  currencies with IndexedDB local persistence and automatic Cloud Firestore sync.
+                  vehicles, office furnishings, and industrial machinery with IndexedDB local
+                  persistence and automatic Supabase PostgreSQL & Storage synchronization.
                 </p>
 
-                {authError && (
-                  <div className="p-3.5 rounded-xl bg-red-50 border border-red-200 text-xs text-red-700 max-w-lg">
-                    {authError}
-                  </div>
-                )}
-
-                <div className="pt-1 flex flex-wrap items-center gap-4">
-                  <button
-                    type="button"
-                    disabled={isSigningIn}
-                    onClick={() => void handleGoogleSignIn()}
-                    className="min-h-[48px] px-6 py-3 text-sm font-semibold text-white bg-slate-900 hover:bg-slate-800 disabled:opacity-50 rounded-xl transition-colors inline-flex items-center gap-2.5 whitespace-nowrap"
-                  >
-                    <LogIn className="w-4 h-4" />
-                    <span>{isSigningIn ? 'Connecting Account...' : 'Sign In with Google'}</span>
-                  </button>
-                </div>
-              </div>
-
-              <div className="lg:col-span-5 bg-white border border-slate-200 rounded-2xl p-6 sm:p-8 space-y-6">
-                <div className="space-y-1">
-                  <h2 className="text-base font-semibold text-slate-900">
-                    Operational Architecture
-                  </h2>
-                  <p className="text-xs text-slate-500">
-                    Production-ready capabilities included in your workspace
-                  </p>
-                </div>
-
-                <div className="divide-y divide-slate-100 text-sm">
+                <div className="divide-y divide-slate-200 border-t border-b border-slate-200 text-sm max-w-2xl">
                   <div id="capabilities" className="py-4 space-y-1">
                     <div className="font-semibold text-slate-900">
-                      01. Multicurrency Valuation & QR Tagging
+                      01. Executive Valuation & QR Tagging
                     </div>
                     <p className="text-xs text-slate-600 leading-relaxed">
-                      Register assets in USD, EUR, GBP, JPY, CAD, AUD, CHF, INR, SGD, ZAR, NGN, or
-                      BRL and consolidate executive KPIs in any reporting currency.
+                      Monitor portfolio book value, monthly acquisitions, camera barcode/QR
+                      scanning, and downloadable asset QR labels.
                     </p>
                   </div>
 
                   <div id="offline-sync" className="py-4 space-y-1">
                     <div className="font-semibold text-slate-900">
-                      02. Offline-First IndexedDB Cache
+                      02. Offline-First IndexedDB Outbox Sync
                     </div>
                     <p className="text-xs text-slate-600 leading-relaxed">
-                      Inspect, register, and update equipment in warehouses without Wi-Fi using
-                      cached FX rates; queued mutations sync automatically upon reconnection.
+                      Inspect, register, and update equipment without Wi-Fi; queued mutations
+                      flush automatically to Supabase PostgreSQL when connectivity returns.
                     </p>
                   </div>
 
                   <div id="security" className="py-4 space-y-1">
                     <div className="font-semibold text-slate-900 flex items-center gap-1.5">
-                      <span>03. Immutable Lifecycle Audit Trail</span>
+                      <span>03. Row Level Security & Immutable Audit Trail</span>
                       <ShieldCheck className="w-4 h-4 text-emerald-600" />
                     </div>
                     <p className="text-xs text-slate-600 leading-relaxed">
-                      Every registration, currency revaluation, and custody transfer is logged with
-                      server-verified timestamps and strict owner-isolated Firestore rules.
+                      Every registration, revaluation, and custody transfer is logged in
+                      PostgreSQL with owner-isolated RLS policies.
                     </p>
                   </div>
+                </div>
+              </div>
+
+              {/* Supabase Auth Card */}
+              <div className="lg:col-span-5 bg-white border border-slate-200 rounded-2xl p-6 sm:p-8 space-y-5">
+                {supabaseConfigured ? (
+                  <>
+                    <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-xl">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setAuthMode('login');
+                          setAuthError(null);
+                        }}
+                        className={`flex-1 min-h-[38px] text-xs font-medium rounded-lg transition-colors ${
+                          authMode === 'login'
+                            ? 'bg-white text-slate-900 shadow-xs font-semibold'
+                            : 'text-slate-600 hover:text-slate-900'
+                        }`}
+                      >
+                        Sign In
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setAuthMode('signup');
+                          setAuthError(null);
+                        }}
+                        className={`flex-1 min-h-[38px] text-xs font-medium rounded-lg transition-colors ${
+                          authMode === 'signup'
+                            ? 'bg-white text-slate-900 shadow-xs font-semibold'
+                            : 'text-slate-600 hover:text-slate-900'
+                        }`}
+                      >
+                        Create Account
+                      </button>
+                    </div>
+
+                    {authInfoMessage && (
+                      <div className="p-3.5 rounded-xl bg-emerald-50 border border-emerald-200 text-xs text-emerald-800">
+                        {authInfoMessage}
+                      </div>
+                    )}
+
+                    {authError && (
+                      <div className="p-3.5 rounded-xl bg-red-50 border border-red-200 text-xs text-red-700">
+                        {authError}
+                      </div>
+                    )}
+
+                    <form onSubmit={handleSupabaseAuthSubmit} className="space-y-4">
+                      <div>
+                        <label className="block text-xs font-medium text-slate-700 mb-1.5">
+                          Work Email
+                        </label>
+                        <input
+                          type="email"
+                          required
+                          value={emailInput}
+                          onChange={(e) => setEmailInput(e.target.value)}
+                          placeholder="name@company.com"
+                          className="w-full min-h-[44px] px-3.5 py-2 text-sm bg-white border border-slate-200 rounded-xl text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-600"
+                        />
+                      </div>
+
+                      <div>
+                        <label className="block text-xs font-medium text-slate-700 mb-1.5">
+                          Password
+                        </label>
+                        <input
+                          type="password"
+                          required
+                          minLength={6}
+                          value={passwordInput}
+                          onChange={(e) => setPasswordInput(e.target.value)}
+                          placeholder="Minimum 6 characters"
+                          className="w-full min-h-[44px] px-3.5 py-2 text-sm bg-white border border-slate-200 rounded-xl text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-600"
+                        />
+                      </div>
+
+                      <button
+                        type="submit"
+                        disabled={isAuthenticating}
+                        className="w-full min-h-[48px] px-5 py-2.5 text-sm font-semibold text-white bg-slate-900 hover:bg-slate-800 disabled:opacity-50 rounded-xl transition-colors inline-flex items-center justify-center gap-2"
+                      >
+                        {authMode === 'login' ? (
+                          <>
+                            <LogIn className="w-4 h-4" />
+                            <span>{isAuthenticating ? 'Signing In...' : 'Sign In to Supabase'}</span>
+                          </>
+                        ) : (
+                          <>
+                            <UserPlus className="w-4 h-4" />
+                            <span>{isAuthenticating ? 'Creating Account...' : 'Create Account'}</span>
+                          </>
+                        )}
+                      </button>
+                    </form>
+                  </>
+                ) : (
+                  <div className="space-y-4">
+                    <div>
+                      <h2 className="text-base font-semibold text-slate-900">
+                        Connect Your Supabase Project
+                      </h2>
+                      <p className="text-xs text-slate-600 mt-1 leading-relaxed">
+                        Configure <span className="font-mono text-slate-900">SUPABASE_URL</span>{' '}
+                        and <span className="font-mono text-slate-900">SUPABASE_ANON_KEY</span>{' '}
+                        (plus optional{' '}
+                        <span className="font-mono text-slate-900">SUPABASE_SERVICE_ROLE_KEY</span>)
+                        in the Secrets panel, and execute{' '}
+                        <span className="font-mono text-slate-900">supabase/schema.sql</span> in
+                        your Supabase SQL Editor.
+                      </p>
+                    </div>
+                  </div>
+                )}
+
+                <div className="pt-4 border-t border-slate-100">
+                  <button
+                    type="button"
+                    onClick={handleEnterOfflineWorkspace}
+                    className="w-full min-h-[44px] px-4 py-2 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-xl transition-colors inline-flex items-center justify-center gap-2"
+                  >
+                    <HardDrive className="w-4 h-4" />
+                    <span>Continue in Local Offline Workspace</span>
+                  </button>
                 </div>
               </div>
             </section>
           </div>
         ) : (
-          /* Authenticated Views */
-          <>
+          /* Active Workspace Views */
+          <div className="space-y-6">
+            {syncWarning && (
+              <div className="p-4 rounded-xl bg-amber-50 border border-amber-200 text-xs text-amber-900 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                <span>
+                  {syncWarning} Changes remain safely stored in your local IndexedDB cache.
+                </span>
+                <button
+                  type="button"
+                  onClick={() => void runFullCloudSync()}
+                  className="min-h-[34px] px-3 py-1 bg-white border border-amber-300 rounded-lg font-medium hover:bg-amber-100/50 shrink-0 whitespace-nowrap"
+                >
+                  Retry Sync
+                </button>
+              </div>
+            )}
+
             {activeTab === 'dashboard' && (
               <DashboardView
                 assets={assets}
-                reportingCurrency={reportingCurrency}
-                usdRates={fxSnapshot.usdRates}
                 isLoading={loadingAssets}
                 isSeeding={isSeeding}
                 onOpenAddAsset={() => openNewAssetModal()}
@@ -753,8 +768,6 @@ function AssetTrackWorkspace() {
             {activeTab === 'inventory' && (
               <InventoryView
                 assets={assets}
-                reportingCurrency={reportingCurrency}
-                usdRates={fxSnapshot.usdRates}
                 selectedCategory={filterCategory}
                 selectedStatus={filterStatus}
                 onChangeCategory={setFilterCategory}
@@ -768,16 +781,11 @@ function AssetTrackWorkspace() {
             {activeTab === 'reports' && (
               <ReportsView
                 assets={assets}
-                reportingCurrency={reportingCurrency}
-                fxSnapshot={fxSnapshot}
-                isRefreshingFx={isRefreshingFx}
-                isOnline={effectiveOnline}
-                onRefreshFx={() => void refreshExchangeRates(true)}
                 onExportCsv={handleExportCsv}
                 onSelectAsset={(asset) => setSelectedAssetId(asset.assetId)}
               />
             )}
-          </>
+          </div>
         )}
       </main>
 
@@ -850,18 +858,15 @@ function AssetTrackWorkspace() {
             isOpen={isFormOpen}
             onClose={() => setIsFormOpen(false)}
             editingAsset={editingAsset}
-            defaultCurrency={reportingCurrency}
             prefilledSerial={prefilledSerial}
-            userId={user.uid}
-            isOnline={effectiveOnline}
+            isOnline={canSyncCloud}
             onSubmit={handleFormSave}
           />
 
           <AssetDetailModal
             asset={selectedAsset}
-            userId={user.uid}
-            reportingCurrency={reportingCurrency}
-            usdRates={fxSnapshot.usdRates}
+            userId={user.id}
+            canSyncCloud={canSyncCloud}
             onClose={() => setSelectedAssetId(null)}
             onEdit={openEditAssetModal}
             onStatusChange={handleQuickStatusUpdate}

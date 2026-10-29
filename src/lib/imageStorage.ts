@@ -1,16 +1,15 @@
-import { getDownloadURL, ref, uploadBytes } from 'firebase/storage';
-import { storage } from './firebase';
 import { SCHEMA_LIMITS } from '../types/asset';
+import { apiUploadPhotoToSupabaseStorage, getAccessToken } from './supabaseApi';
 
 export interface ProcessedPhotoResult {
   url: string;
-  storageType: 'firebase-storage' | 'offline-embedded';
+  storageType: 'supabase-storage' | 'offline-embedded';
 }
 
 /**
  * Compresses an image File or Blob to a high-clarity JPEG bounded within
- * Firestore & Storage limits so both online Cloud Storage uploads and
- * offline local persistence succeed reliably.
+ * payload limits so both online Supabase Storage uploads and offline
+ * IndexedDB persistence succeed reliably.
  */
 export async function compressImageBlob(
   source: Blob,
@@ -77,18 +76,17 @@ export async function compressImageBlob(
 }
 
 /**
- * Uploads compressed asset photo to Firebase Storage when online,
- * with resilient offline-first fallback to compressed data URL when offline
- * or if Cloud Storage bucket writes are unavailable.
+ * Uploads compressed asset photo to Supabase Storage ('asset-photos' bucket)
+ * when online with an active Supabase session, falling back to compressed
+ * data URL when offline so asset registration never stalls.
  */
 export async function uploadAssetPhoto(
   fileOrBlob: Blob,
-  userId: string,
   isOnline: boolean
 ): Promise<ProcessedPhotoResult> {
-  const { blob, dataUrl } = await compressImageBlob(fileOrBlob);
+  const { dataUrl } = await compressImageBlob(fileOrBlob);
 
-  if (!isOnline) {
+  if (!isOnline || !getAccessToken()) {
     return {
       url: dataUrl,
       storageType: 'offline-embedded',
@@ -96,32 +94,21 @@ export async function uploadAssetPhoto(
   }
 
   try {
-    const objectPath = `assets/${userId}/photo_${Date.now()}_${Math.random()
-      .toString(36)
-      .slice(2, 8)}.jpg`;
-    const storageRef = ref(storage, objectPath);
-
-    const uploadTask = uploadBytes(storageRef, blob, {
-      contentType: 'image/jpeg',
-    });
-
-    // Bound Storage upload attempt to 4.5s so unprovisioned buckets or flaky cellular links never hang UI
-    const snapshot = await Promise.race([
-      uploadTask,
+    const publicUrl = await Promise.race([
+      apiUploadPhotoToSupabaseStorage(dataUrl),
       new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error('Storage upload timed out')), 4500)
+        setTimeout(() => reject(new Error('Storage upload timed out')), 5000)
       ),
     ]);
 
-    const downloadUrl = await getDownloadURL(snapshot.ref);
-    if (downloadUrl.length <= SCHEMA_LIMITS.PHOTO_URL_MAX_LEN) {
+    if (publicUrl && publicUrl.length <= SCHEMA_LIMITS.PHOTO_URL_MAX_LEN) {
       return {
-        url: downloadUrl,
-        storageType: 'firebase-storage',
+        url: publicUrl,
+        storageType: 'supabase-storage',
       };
     }
   } catch {
-    // Graceful fallback ensures asset registration works offline and on Spark projects without Storage rules
+    // Graceful fallback preserves photo locally for offline sync or uninitialized bucket
   }
 
   return {
