@@ -1,0 +1,6 @@
+{
+  "name": "Asset Track",
+  "description": "Offline-first corporate asset and inventory management application with real-time cloud sync, barcode/QR scanning, valuation tracking, and executive reporting.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

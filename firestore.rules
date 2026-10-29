@@ -1,0 +1,288 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Pillar 0: Global default-deny safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Hardened Global Primitives
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isEmailVerified() {
+      return isSignedIn()
+        && request.auth.token.email_verified == true
+        && request.auth.token.email is string
+        && request.auth.token.email.size() >= 3
+        && request.auth.token.email.size() <= 160;
+    }
+
+    function isValidId(id) {
+      return id is string
+        && id.size() >= 1
+        && id.size() <= 128
+        && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // Blueprint Validation Helper: Asset
+    function isValidAsset(data, assetId) {
+      return data.keys().hasAll([
+          'assetId',
+          'ownerId',
+          'name',
+          'serialNumber',
+          'category',
+          'purchasePrice',
+          'currentValuation',
+          'purchaseDate',
+          'warrantyExpiry',
+          'status',
+          'department',
+          'location',
+          'assignedTo',
+          'notes',
+          'photoUrl',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'assetId',
+          'ownerId',
+          'name',
+          'serialNumber',
+          'category',
+          'purchasePrice',
+          'currentValuation',
+          'purchaseDate',
+          'warrantyExpiry',
+          'status',
+          'department',
+          'location',
+          'assignedTo',
+          'notes',
+          'photoUrl',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.assetId is string
+        && data.assetId.size() >= 1
+        && data.assetId.size() <= 128
+        && data.assetId.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.assetId == assetId
+        && data.ownerId is string
+        && data.ownerId.size() >= 1
+        && data.ownerId.size() <= 128
+        && data.ownerId.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.ownerId == request.auth.uid
+        && data.name is string
+        && data.name.size() >= 1
+        && data.name.size() <= 120
+        && data.serialNumber is string
+        && data.serialNumber.size() >= 1
+        && data.serialNumber.size() <= 80
+        && data.category is string
+        && data.category.size() <= 40
+        && data.category in [
+          'IT Hardware',
+          'Office Furniture',
+          'Vehicles',
+          'Machinery',
+          'Lab & Medical',
+          'Other'
+        ]
+        && (data.purchasePrice is int || data.purchasePrice is float)
+        && data.purchasePrice >= 0
+        && data.purchasePrice <= 1000000000
+        && (data.currentValuation is int || data.currentValuation is float)
+        && data.currentValuation >= 0
+        && data.currentValuation <= 1000000000
+        && data.purchaseDate is string
+        && data.purchaseDate.size() == 10
+        && data.purchaseDate.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
+        && data.warrantyExpiry is string
+        && data.warrantyExpiry.size() <= 10
+        && data.warrantyExpiry.matches('^([0-9]{4}-[0-9]{2}-[0-9]{2})?$')
+        && data.status is string
+        && data.status.size() <= 20
+        && data.status in [
+          'In Use',
+          'Available',
+          'Maintenance',
+          'Disposed'
+        ]
+        && data.department is string
+        && data.department.size() >= 1
+        && data.department.size() <= 80
+        && data.location is string
+        && data.location.size() >= 1
+        && data.location.size() <= 120
+        && data.assignedTo is string
+        && data.assignedTo.size() <= 100
+        && data.notes is string
+        && data.notes.size() <= 1000
+        && data.photoUrl is string
+        && data.photoUrl.size() <= 350000
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    // Blueprint Validation Helper: AssetEvent
+    function isValidAssetEvent(data, assetId, eventId) {
+      return data.keys().hasAll([
+          'eventId',
+          'assetId',
+          'ownerId',
+          'action',
+          'summary',
+          'actorEmail',
+          'createdAt'
+        ])
+        && data.keys().hasOnly([
+          'eventId',
+          'assetId',
+          'ownerId',
+          'action',
+          'summary',
+          'actorEmail',
+          'createdAt'
+        ])
+        && data.eventId is string
+        && data.eventId.size() >= 1
+        && data.eventId.size() <= 128
+        && data.eventId.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.eventId == eventId
+        && data.assetId is string
+        && data.assetId.size() >= 1
+        && data.assetId.size() <= 128
+        && data.assetId.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.assetId == assetId
+        && data.ownerId is string
+        && data.ownerId.size() >= 1
+        && data.ownerId.size() <= 128
+        && data.ownerId.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.ownerId == request.auth.uid
+        && data.action is string
+        && data.action.size() <= 40
+        && data.action in [
+          'Asset Registered',
+          'Details Updated',
+          'Status Changed',
+          'Valuation Adjusted',
+          'Photo Updated'
+        ]
+        && data.summary is string
+        && data.summary.size() >= 1
+        && data.summary.size() <= 300
+        && data.actorEmail is string
+        && data.actorEmail.size() >= 3
+        && data.actorEmail.size() <= 160
+        && data.actorEmail == request.auth.token.email
+        && data.createdAt is timestamp;
+    }
+
+    // Collection: /assets/{assetId}
+    match /assets/{assetId} {
+      allow get: if isEmailVerified()
+        && isValidId(assetId)
+        && existing().ownerId == request.auth.uid;
+
+      allow list: if isEmailVerified()
+        && existing().ownerId == request.auth.uid;
+
+      allow create: if isEmailVerified()
+        && isValidId(assetId)
+        && isValidAsset(incoming(), assetId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if isEmailVerified()
+        && isValidId(assetId)
+        && isValidAsset(incoming(), assetId)
+        && existing().ownerId == request.auth.uid
+        && existing().status != 'Disposed'
+        && incoming().ownerId == existing().ownerId
+        && incoming().assetId == existing().assetId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          // Action 1: Status or Assignment Transition
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'status',
+            'assignedTo',
+            'location',
+            'updatedAt'
+          ])
+          ||
+          // Action 2: Financial Revaluation
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'currentValuation',
+            'notes',
+            'updatedAt'
+          ])
+          ||
+          // Action 3: Full Asset Record Edit
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'name',
+            'serialNumber',
+            'category',
+            'purchasePrice',
+            'currentValuation',
+            'purchaseDate',
+            'warrantyExpiry',
+            'status',
+            'department',
+            'location',
+            'assignedTo',
+            'notes',
+            'photoUrl',
+            'updatedAt'
+          ])
+        );
+
+      allow delete: if isEmailVerified()
+        && isValidId(assetId)
+        && existing().ownerId == request.auth.uid;
+
+      // Subcollection: /assets/{assetId}/events/{eventId}
+      match /events/{eventId} {
+        allow get: if isEmailVerified()
+          && isValidId(assetId)
+          && isValidId(eventId)
+          && existing().ownerId == request.auth.uid
+          && get(/databases/$(database)/documents/assets/$(assetId)).data.ownerId == request.auth.uid;
+
+        allow list: if isEmailVerified()
+          && existing().ownerId == request.auth.uid
+          && existing().assetId == assetId;
+
+        allow create: if isEmailVerified()
+          && isValidId(assetId)
+          && isValidId(eventId)
+          && isValidAssetEvent(incoming(), assetId, eventId)
+          && incoming().createdAt == request.time
+          && existsAfter(/databases/$(database)/documents/assets/$(assetId))
+          && getAfter(/databases/$(database)/documents/assets/$(assetId)).data.ownerId == request.auth.uid;
+
+        allow update: if false;
+
+        allow delete: if isEmailVerified()
+          && isValidId(assetId)
+          && isValidId(eventId)
+          && existing().ownerId == request.auth.uid
+          && exists(/databases/$(database)/documents/assets/$(assetId))
+          && get(/databases/$(database)/documents/assets/$(assetId)).data.ownerId == request.auth.uid;
+      }
+    }
+  }
+}
