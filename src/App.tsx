@@ -3,10 +3,11 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { onAuthStateChanged, signInWithPopup, signOut, User } from 'firebase/auth';
 import {
   collection,
+  doc,
   onSnapshot,
   query,
   Timestamp,
@@ -17,10 +18,10 @@ import {
   Boxes,
   CheckCircle2,
   CloudOff,
+  Globe,
   LayoutDashboard,
   LogIn,
   LogOut,
-  Plus,
   QrCode,
   RefreshCw,
   ShieldCheck,
@@ -36,6 +37,17 @@ import {
   setFirestoreNetworkEnabled,
 } from './lib/firebase';
 import {
+  cacheReportingCurrencyLocally,
+  CURRENCY_META,
+  CurrencyCode,
+  fetchLiveFxRates,
+  FxRatesSnapshot,
+  isValidCurrencyCode,
+  loadCachedReportingCurrency,
+  loadInitialFxRates,
+  SUPPORTED_CURRENCIES,
+} from './lib/currency';
+import {
   AssetCategory,
   AssetFormInput,
   AssetRecord,
@@ -45,6 +57,7 @@ import {
   createAssetWithEvent,
   deleteAssetWithEvents,
   exportAssetsToCsv,
+  saveUserReportingCurrency,
   seedSampleAssets,
   updateAssetStatusAction,
   updateAssetValuationAction,
@@ -74,6 +87,13 @@ function AssetTrackWorkspace() {
   const [loadingAssets, setLoadingAssets] = useState(true);
   const [isSeeding, setIsSeeding] = useState(false);
 
+  // Multicurrency Portfolio Reporting State + Live/Offline FX Rates
+  const [reportingCurrency, setReportingCurrency] = useState<CurrencyCode>(() =>
+    loadCachedReportingCurrency()
+  );
+  const [fxSnapshot, setFxSnapshot] = useState<FxRatesSnapshot>(() => loadInitialFxRates());
+  const [isRefreshingFx, setIsRefreshingFx] = useState(false);
+
   // Real-time connectivity + Offline simulation state
   const [browserOnline, setBrowserOnline] = useState<boolean>(() =>
     typeof navigator !== 'undefined' ? navigator.onLine : true
@@ -92,6 +112,29 @@ function AssetTrackWorkspace() {
   const [toastMessage, setToastMessage] = useState<string | null>(null);
 
   const effectiveOnline = browserOnline && !simulatedOffline;
+
+  const refreshExchangeRates = useCallback(async (showToast = false) => {
+    setIsRefreshingFx(true);
+    try {
+      const latest = await fetchLiveFxRates();
+      setFxSnapshot(latest);
+      if (showToast) {
+        setToastMessage('Updated live market FX exchange rates');
+      }
+    } catch {
+      if (showToast) {
+        setToastMessage('Using cached FX rates · Live rate service unreachable');
+      }
+    } finally {
+      setIsRefreshingFx(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (effectiveOnline) {
+      void refreshExchangeRates(false);
+    }
+  }, [effectiveOnline, refreshExchangeRates]);
 
   useEffect(() => {
     const handleOnline = () => setBrowserOnline(true);
@@ -112,6 +155,29 @@ function AssetTrackWorkspace() {
     return () => unsubscribe();
   }, []);
 
+  // Subscribe to user reporting currency preference in Firestore
+  useEffect(() => {
+    if (!authReady || !user) return;
+    const settingsPath = `userSettings/${user.uid}`;
+    const unsubscribe = onSnapshot(
+      doc(db, 'userSettings', user.uid),
+      (docSnap) => {
+        if (docSnap.exists()) {
+          const data = docSnap.data();
+          if (isValidCurrencyCode(data.reportingCurrency)) {
+            setReportingCurrency(data.reportingCurrency);
+            cacheReportingCurrencyLocally(data.reportingCurrency);
+          }
+        }
+      },
+      (error) => {
+        handleFirestoreError(error, OperationType.GET, settingsPath);
+      }
+    );
+    return () => unsubscribe();
+  }, [authReady, user]);
+
+  // Subscribe to user assets in Firestore
   useEffect(() => {
     if (!authReady) return;
     if (!user) {
@@ -134,6 +200,9 @@ function AssetTrackWorkspace() {
             data.createdAt instanceof Timestamp ? data.createdAt.toDate() : new Date();
           const updatedAt =
             data.updatedAt instanceof Timestamp ? data.updatedAt.toDate() : new Date();
+          const ccy: CurrencyCode = isValidCurrencyCode(data.currency)
+            ? data.currency
+            : 'USD';
 
           return {
             assetId: String(data.assetId || docSnap.id),
@@ -141,6 +210,7 @@ function AssetTrackWorkspace() {
             name: String(data.name || ''),
             serialNumber: String(data.serialNumber || ''),
             category: (data.category as AssetCategory) || 'Other',
+            currency: ccy,
             purchasePrice: Number(data.purchasePrice || 0),
             currentValuation: Number(data.currentValuation || 0),
             purchaseDate: String(data.purchaseDate || ''),
@@ -185,6 +255,19 @@ function AssetTrackWorkspace() {
     () => assets.find((a) => a.assetId === selectedAssetId) || null,
     [assets, selectedAssetId]
   );
+
+  const handleReportingCurrencyChange = async (nextCurrency: CurrencyCode) => {
+    setReportingCurrency(nextCurrency);
+    cacheReportingCurrencyLocally(nextCurrency);
+    if (user) {
+      await saveUserReportingCurrency({
+        userId: user.uid,
+        reportingCurrency: nextCurrency,
+        isOnline: effectiveOnline,
+      });
+    }
+    setToastMessage(`Portfolio reporting currency set to ${nextCurrency}`);
+  };
 
   const handleGoogleSignIn = async () => {
     setAuthError(null);
@@ -266,7 +349,7 @@ function AssetTrackWorkspace() {
       setToastMessage(
         syncState === 'queued-offline'
           ? 'Asset saved locally · Queued for background sync'
-          : 'New asset registered and synced'
+          : `New asset registered in ${input.currency}`
       );
     }
   };
@@ -287,11 +370,16 @@ function AssetTrackWorkspace() {
     );
   };
 
-  const handleQuickValuationUpdate = async (asset: AssetRecord, nextValuation: number) => {
+  const handleQuickValuationUpdate = async (
+    asset: AssetRecord,
+    nextValuation: number,
+    nextCurrency: CurrencyCode
+  ) => {
     if (!user || !user.email) return;
     const syncState = await updateAssetValuationAction({
       existing: asset,
       newValuation: nextValuation,
+      newCurrency: nextCurrency,
       ownerId: user.uid,
       actorEmail: user.email,
       isOnline: effectiveOnline,
@@ -299,7 +387,7 @@ function AssetTrackWorkspace() {
     setToastMessage(
       syncState === 'queued-offline'
         ? 'Valuation saved locally · Pending sync'
-        : 'Valuation updated and synced'
+        : `Valuation updated in ${nextCurrency}`
     );
   };
 
@@ -328,8 +416,8 @@ function AssetTrackWorkspace() {
       });
       setToastMessage(
         syncState === 'queued-offline'
-          ? 'Sample catalog saved locally'
-          : 'Sample corporate inventory loaded'
+          ? 'Multicurrency sample catalog saved locally'
+          : 'Loaded sample catalog (USD, EUR, GBP)'
       );
     } finally {
       setIsSeeding(false);
@@ -337,8 +425,8 @@ function AssetTrackWorkspace() {
   };
 
   const handleExportCsv = () => {
-    exportAssetsToCsv(assets);
-    setToastMessage('Exported inventory CSV ledger');
+    exportAssetsToCsv(assets, reportingCurrency, fxSnapshot.usdRates);
+    setToastMessage(`Exported multicurrency CSV ledger (${reportingCurrency})`);
   };
 
   return (
@@ -453,11 +541,11 @@ function AssetTrackWorkspace() {
         </div>
       </header>
 
-      {/* Workspace Sync & Account Toolbar (Only when authenticated) */}
+      {/* Workspace Sync, Multicurrency Base Selector & Account Toolbar */}
       {user && (
         <div className="bg-white border-b border-slate-200 px-4 sm:px-6 lg:px-8 py-2.5">
           <div className="max-w-7xl mx-auto flex flex-wrap items-center justify-between gap-3 text-xs">
-            {/* Visual Offline-First & Real-Time Sync Status Indicator */}
+            {/* Left: Sync Status + Offline Toggle + Portfolio Currency Selector */}
             <div className="flex flex-wrap items-center gap-3">
               {!effectiveOnline ? (
                 <div className="inline-flex items-center gap-1.5 font-medium text-amber-800">
@@ -483,6 +571,33 @@ function AssetTrackWorkspace() {
                 |
               </span>
 
+              {/* Consolidated Portfolio Currency Selector */}
+              <div className="inline-flex items-center gap-1.5">
+                <Globe className="w-3.5 h-3.5 text-slate-500 shrink-0" />
+                <label htmlFor="reporting-currency-select" className="text-slate-600 hidden sm:inline">
+                  Portfolio:
+                </label>
+                <select
+                  id="reporting-currency-select"
+                  value={reportingCurrency}
+                  onChange={(e) =>
+                    void handleReportingCurrencyChange(e.target.value as CurrencyCode)
+                  }
+                  aria-label="Consolidated portfolio reporting currency"
+                  className="min-h-[32px] px-2 py-1 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-900 font-mono font-semibold focus:outline-none focus:ring-2 focus:ring-blue-600"
+                >
+                  {SUPPORTED_CURRENCIES.map((code) => (
+                    <option key={code} value={code}>
+                      {code} ({CURRENCY_META[code].symbol})
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <span aria-hidden="true" className="text-slate-300">
+                |
+              </span>
+
               <button
                 type="button"
                 disabled={togglingNetwork}
@@ -503,9 +618,9 @@ function AssetTrackWorkspace() {
               </button>
             </div>
 
-            {/* Authenticated User & Sign Out */}
+            {/* Right: Authenticated User & Sign Out */}
             <div className="flex items-center gap-3 text-slate-600">
-              <span className="hidden sm:inline truncate max-w-[220px]">
+              <span className="hidden lg:inline truncate max-w-[220px]">
                 {user.email}
               </span>
               <button
@@ -534,18 +649,18 @@ function AssetTrackWorkspace() {
             <section className="grid grid-cols-1 lg:grid-cols-12 gap-10 items-center">
               <div className="lg:col-span-7 space-y-6">
                 <p className="text-xs font-semibold text-blue-600">
-                  Corporate Capital & Equipment Registry
+                  Multicurrency Corporate Capital & Equipment Registry
                 </p>
                 <h1
                   className="text-3xl sm:text-5xl font-bold tracking-tight text-slate-900 leading-[1.12]"
                   style={{ textWrap: 'balance' }}
                 >
-                  Track every physical asset, valuation, and custody handoff—online or offline.
+                  Track every physical asset, global currency valuation, and custody handoff—online or offline.
                 </h1>
                 <p className="text-base text-slate-600 leading-relaxed max-w-2xl">
                   Built for medium-sized operations teams managing IT workstations, fleet
-                  vehicles, office furnishings, and industrial machinery with IndexedDB local
-                  persistence and automatic Cloud Firestore synchronization.
+                  vehicles, office furnishings, and industrial machinery across 12 global
+                  currencies with IndexedDB local persistence and automatic Cloud Firestore sync.
                 </p>
 
                 {authError && (
@@ -580,11 +695,11 @@ function AssetTrackWorkspace() {
                 <div className="divide-y divide-slate-100 text-sm">
                   <div id="capabilities" className="py-4 space-y-1">
                     <div className="font-semibold text-slate-900">
-                      01. Executive Valuation & QR Tagging
+                      01. Multicurrency Valuation & QR Tagging
                     </div>
                     <p className="text-xs text-slate-600 leading-relaxed">
-                      Monitor portfolio book value, monthly acquisitions, camera barcode/QR
-                      scanning, and downloadable asset QR labels.
+                      Register assets in USD, EUR, GBP, JPY, CAD, AUD, CHF, INR, SGD, ZAR, NGN, or
+                      BRL and consolidate executive KPIs in any reporting currency.
                     </p>
                   </div>
 
@@ -593,8 +708,8 @@ function AssetTrackWorkspace() {
                       02. Offline-First IndexedDB Cache
                     </div>
                     <p className="text-xs text-slate-600 leading-relaxed">
-                      Inspect, register, and update equipment in warehouses or basements without
-                      Wi-Fi; queued mutations sync automatically upon reconnection.
+                      Inspect, register, and update equipment in warehouses without Wi-Fi using
+                      cached FX rates; queued mutations sync automatically upon reconnection.
                     </p>
                   </div>
 
@@ -604,7 +719,7 @@ function AssetTrackWorkspace() {
                       <ShieldCheck className="w-4 h-4 text-emerald-600" />
                     </div>
                     <p className="text-xs text-slate-600 leading-relaxed">
-                      Every registration, revaluation, and custody transfer is logged with
+                      Every registration, currency revaluation, and custody transfer is logged with
                       server-verified timestamps and strict owner-isolated Firestore rules.
                     </p>
                   </div>
@@ -618,6 +733,8 @@ function AssetTrackWorkspace() {
             {activeTab === 'dashboard' && (
               <DashboardView
                 assets={assets}
+                reportingCurrency={reportingCurrency}
+                usdRates={fxSnapshot.usdRates}
                 isLoading={loadingAssets}
                 isSeeding={isSeeding}
                 onOpenAddAsset={() => openNewAssetModal()}
@@ -636,6 +753,8 @@ function AssetTrackWorkspace() {
             {activeTab === 'inventory' && (
               <InventoryView
                 assets={assets}
+                reportingCurrency={reportingCurrency}
+                usdRates={fxSnapshot.usdRates}
                 selectedCategory={filterCategory}
                 selectedStatus={filterStatus}
                 onChangeCategory={setFilterCategory}
@@ -649,6 +768,11 @@ function AssetTrackWorkspace() {
             {activeTab === 'reports' && (
               <ReportsView
                 assets={assets}
+                reportingCurrency={reportingCurrency}
+                fxSnapshot={fxSnapshot}
+                isRefreshingFx={isRefreshingFx}
+                isOnline={effectiveOnline}
+                onRefreshFx={() => void refreshExchangeRates(true)}
                 onExportCsv={handleExportCsv}
                 onSelectAsset={(asset) => setSelectedAssetId(asset.assetId)}
               />
@@ -657,7 +781,7 @@ function AssetTrackWorkspace() {
         )}
       </main>
 
-      {/* Mobile Fixed Bottom Thumb-Zone Tab Bar (<= 15% sticky budget alongside 56px top bar) */}
+      {/* Mobile Fixed Bottom Thumb-Zone Tab Bar */}
       {user && (
         <nav
           aria-label="Mobile Bottom Navigation"
@@ -726,6 +850,7 @@ function AssetTrackWorkspace() {
             isOpen={isFormOpen}
             onClose={() => setIsFormOpen(false)}
             editingAsset={editingAsset}
+            defaultCurrency={reportingCurrency}
             prefilledSerial={prefilledSerial}
             userId={user.uid}
             isOnline={effectiveOnline}
@@ -735,6 +860,8 @@ function AssetTrackWorkspace() {
           <AssetDetailModal
             asset={selectedAsset}
             userId={user.uid}
+            reportingCurrency={reportingCurrency}
+            usdRates={fxSnapshot.usdRates}
             onClose={() => setSelectedAssetId(null)}
             onEdit={openEditAssetModal}
             onStatusChange={handleQuickStatusUpdate}

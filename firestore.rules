@@ -27,6 +27,25 @@ service cloud.firestore {
         && id.matches('^[a-zA-Z0-9_\\-]+$');
     }
 
+    function isValidCurrency(code) {
+      return code is string
+        && code.size() == 3
+        && code in [
+          'USD',
+          'EUR',
+          'GBP',
+          'CAD',
+          'AUD',
+          'JPY',
+          'CHF',
+          'INR',
+          'SGD',
+          'ZAR',
+          'NGN',
+          'BRL'
+        ];
+    }
+
     function incoming() {
       return request.resource.data;
     }
@@ -43,6 +62,7 @@ service cloud.firestore {
           'name',
           'serialNumber',
           'category',
+          'currency',
           'purchasePrice',
           'currentValuation',
           'purchaseDate',
@@ -62,6 +82,7 @@ service cloud.firestore {
           'name',
           'serialNumber',
           'category',
+          'currency',
           'purchasePrice',
           'currentValuation',
           'purchaseDate',
@@ -101,6 +122,7 @@ service cloud.firestore {
           'Lab & Medical',
           'Other'
         ]
+        && isValidCurrency(data.currency)
         && (data.purchasePrice is int || data.purchasePrice is float)
         && data.purchasePrice >= 0
         && data.purchasePrice <= 1000000000
@@ -191,6 +213,55 @@ service cloud.firestore {
         && data.createdAt is timestamp;
     }
 
+    // Blueprint Validation Helper: UserSettings
+    function isValidUserSettings(data, userId) {
+      return data.keys().hasAll([
+          'userId',
+          'reportingCurrency',
+          'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'userId',
+          'reportingCurrency',
+          'updatedAt'
+        ])
+        && data.userId is string
+        && data.userId.size() >= 1
+        && data.userId.size() <= 128
+        && data.userId.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.userId == userId
+        && data.userId == request.auth.uid
+        && isValidCurrency(data.reportingCurrency)
+        && data.updatedAt is timestamp;
+    }
+
+    // Collection: /userSettings/{userId}
+    match /userSettings/{userId} {
+      allow get: if isEmailVerified()
+        && isValidId(userId)
+        && userId == request.auth.uid;
+
+      allow list: if false;
+
+      allow create: if isEmailVerified()
+        && isValidId(userId)
+        && isValidUserSettings(incoming(), userId)
+        && incoming().updatedAt == request.time;
+
+      allow update: if isEmailVerified()
+        && isValidId(userId)
+        && isValidUserSettings(incoming(), userId)
+        && existing().userId == request.auth.uid
+        && incoming().userId == existing().userId
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'reportingCurrency',
+          'updatedAt'
+        ]);
+
+      allow delete: if false;
+    }
+
     // Collection: /assets/{assetId}
     match /assets/{assetId} {
       allow get: if isEmailVerified()
@@ -216,17 +287,19 @@ service cloud.firestore {
         && incoming().createdAt == existing().createdAt
         && incoming().updatedAt == request.time
         && (
-          // Action 1: Status or Assignment Transition
+          // Action 1: Status or Assignment Transition (includes currency for backward migration of pre-currency records)
           incoming().diff(existing()).affectedKeys().hasOnly([
             'status',
             'assignedTo',
             'location',
+            'currency',
             'updatedAt'
           ])
           ||
-          // Action 2: Financial Revaluation
+          // Action 2: Financial Revaluation & Currency Denomination Update
           incoming().diff(existing()).affectedKeys().hasOnly([
             'currentValuation',
+            'currency',
             'notes',
             'updatedAt'
           ])
@@ -236,6 +309,7 @@ service cloud.firestore {
             'name',
             'serialNumber',
             'category',
+            'currency',
             'purchasePrice',
             'currentValuation',
             'purchaseDate',

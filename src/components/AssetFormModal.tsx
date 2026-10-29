@@ -9,6 +9,11 @@ import {
   X,
 } from 'lucide-react';
 import {
+  CURRENCY_META,
+  CurrencyCode,
+  SUPPORTED_CURRENCIES,
+} from '../lib/currency';
+import {
   ASSET_CATEGORIES,
   ASSET_STATUSES,
   AssetCategory,
@@ -26,6 +31,7 @@ interface AssetFormModalProps {
   isOpen: boolean;
   onClose: () => void;
   editingAsset: AssetRecord | null;
+  defaultCurrency: CurrencyCode;
   prefilledSerial?: string;
   userId: string;
   isOnline: boolean;
@@ -49,6 +55,7 @@ export function AssetFormModal({
   isOpen,
   onClose,
   editingAsset,
+  defaultCurrency,
   prefilledSerial = '',
   userId,
   isOnline,
@@ -59,6 +66,7 @@ export function AssetFormModal({
   const [name, setName] = useState('');
   const [serialNumber, setSerialNumber] = useState('');
   const [category, setCategory] = useState<AssetCategory>('IT Hardware');
+  const [currency, setCurrency] = useState<CurrencyCode>(defaultCurrency);
   const [status, setStatus] = useState<AssetStatus>('In Use');
   const [purchasePrice, setPurchasePrice] = useState('0');
   const [currentValuation, setCurrentValuation] = useState('0');
@@ -85,6 +93,7 @@ export function AssetFormModal({
       setName(editingAsset.name);
       setSerialNumber(editingAsset.serialNumber);
       setCategory(editingAsset.category);
+      setCurrency(editingAsset.currency || defaultCurrency);
       setStatus(editingAsset.status);
       setPurchasePrice(String(editingAsset.purchasePrice));
       setCurrentValuation(String(editingAsset.currentValuation));
@@ -99,6 +108,7 @@ export function AssetFormModal({
       setName('');
       setSerialNumber(prefilledSerial || generateSerialTag('IT Hardware'));
       setCategory('IT Hardware');
+      setCurrency(defaultCurrency);
       setStatus('In Use');
       setPurchasePrice('');
       setCurrentValuation('');
@@ -110,9 +120,12 @@ export function AssetFormModal({
       setNotes('');
       setPhotoUrl('');
     }
-  }, [isOpen, editingAsset, prefilledSerial]);
+  }, [isOpen, editingAsset, prefilledSerial, defaultCurrency]);
 
   if (!isOpen) return null;
+
+  const activeCurrencyMeta = CURRENCY_META[currency];
+  const numberStep = activeCurrencyMeta.zeroDecimal ? '1' : '0.01';
 
   const handlePhotoBlob = async (blob: Blob) => {
     setErrorMsg(null);
@@ -154,6 +167,7 @@ export function AssetFormModal({
         name,
         serialNumber,
         category,
+        currency,
         status,
         purchasePrice: parsedPurchase,
         currentValuation: parsedValuation,
@@ -341,70 +355,88 @@ export function AssetFormModal({
               </div>
             </div>
 
-            {/* Financials & Dates */}
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-2 border-t border-slate-100">
+            {/* Multicurrency Financials & Dates */}
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 pt-2 border-t border-slate-100">
               <div>
                 <label className="block text-xs font-medium text-slate-700 mb-1.5">
-                  Purchase Price (USD) *
+                  Currency *
+                </label>
+                <select
+                  value={currency}
+                  onChange={(e) => setCurrency(e.target.value as CurrencyCode)}
+                  className="w-full min-h-[44px] px-3 py-2 text-sm bg-white border border-slate-200 rounded-xl text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-600"
+                >
+                  {SUPPORTED_CURRENCIES.map((code) => {
+                    const meta = CURRENCY_META[code];
+                    return (
+                      <option key={code} value={code}>
+                        {code} ({meta.symbol}) — {meta.name}
+                      </option>
+                    );
+                  })}
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1.5">
+                  Purchase Price ({currency}) *
                 </label>
                 <input
                   type="number"
                   required
                   min="0"
                   max={SCHEMA_LIMITS.MAX_MONETARY_VALUE}
-                  step="0.01"
+                  step={numberStep}
                   value={purchasePrice}
-                  onChange={(e) => {
-                    const val = e.target.value;
-                    setPurchasePrice(val);
-                    if (!editingAsset && currentValuation === '') {
-                      // Allow user to leave valuation blank to mirror purchase price or type custom
-                    }
-                  }}
-                  placeholder="2500.00"
+                  onChange={(e) => setPurchasePrice(e.target.value)}
+                  placeholder={activeCurrencyMeta.zeroDecimal ? '250000' : '2500.00'}
                   className="w-full min-h-[44px] px-3.5 py-2 text-sm font-mono tabular-nums bg-white border border-slate-200 rounded-xl text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-600"
                 />
               </div>
 
               <div>
                 <label className="block text-xs font-medium text-slate-700 mb-1.5">
-                  Current Valuation (USD) *
+                  Current Valuation ({currency}) *
                 </label>
                 <input
                   type="number"
                   min="0"
                   max={SCHEMA_LIMITS.MAX_MONETARY_VALUE}
-                  step="0.01"
+                  step={numberStep}
                   value={currentValuation}
                   onChange={(e) => setCurrentValuation(e.target.value)}
-                  placeholder={purchasePrice || '2200.00'}
+                  placeholder={
+                    purchasePrice || (activeCurrencyMeta.zeroDecimal ? '220000' : '2200.00')
+                  }
                   className="w-full min-h-[44px] px-3.5 py-2 text-sm font-mono tabular-nums bg-white border border-slate-200 rounded-xl text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-600"
                 />
               </div>
 
-              <div>
-                <label className="block text-xs font-medium text-slate-700 mb-1.5">
-                  Purchase Date *
-                </label>
-                <input
-                  type="date"
-                  required
-                  value={purchaseDate}
-                  onChange={(e) => setPurchaseDate(e.target.value)}
-                  className="w-full min-h-[44px] px-3.5 py-2 text-sm font-mono bg-white border border-slate-200 rounded-xl text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-600"
-                />
-              </div>
+              <div className="sm:col-span-3 grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1.5">
+                    Purchase Date *
+                  </label>
+                  <input
+                    type="date"
+                    required
+                    value={purchaseDate}
+                    onChange={(e) => setPurchaseDate(e.target.value)}
+                    className="w-full min-h-[44px] px-3.5 py-2 text-sm font-mono bg-white border border-slate-200 rounded-xl text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-600"
+                  />
+                </div>
 
-              <div>
-                <label className="block text-xs font-medium text-slate-700 mb-1.5">
-                  Warranty Expiry Date
-                </label>
-                <input
-                  type="date"
-                  value={warrantyExpiry}
-                  onChange={(e) => setWarrantyExpiry(e.target.value)}
-                  className="w-full min-h-[44px] px-3.5 py-2 text-sm font-mono bg-white border border-slate-200 rounded-xl text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-600"
-                />
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1.5">
+                    Warranty Expiry Date
+                  </label>
+                  <input
+                    type="date"
+                    value={warrantyExpiry}
+                    onChange={(e) => setWarrantyExpiry(e.target.value)}
+                    className="w-full min-h-[44px] px-3.5 py-2 text-sm font-mono bg-white border border-slate-200 rounded-xl text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-600"
+                  />
+                </div>
               </div>
             </div>
 

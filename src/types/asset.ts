@@ -2,6 +2,7 @@ import laptopImg from '../assets/images/asset_laptop_workstation_1793292946521.j
 import chairImg from '../assets/images/asset_ergonomic_chair_1793292948096.jpg';
 import vanImg from '../assets/images/asset_fleet_van_1793292948895.jpg';
 import machineryImg from '../assets/images/asset_industrial_machinery_1793292949144.jpg';
+import { CurrencyCode, formatMoney } from '../lib/currency';
 
 export const ASSET_CATEGORIES = [
   'IT Hardware',
@@ -42,6 +43,7 @@ export const SCHEMA_LIMITS = {
   NAME_MAX_LEN: 120,
   SERIAL_MAX_LEN: 80,
   CATEGORY_MAX_LEN: 40,
+  CURRENCY_LEN: 3,
   STATUS_MAX_LEN: 20,
   DEPARTMENT_MAX_LEN: 80,
   LOCATION_MAX_LEN: 120,
@@ -61,6 +63,7 @@ export interface AssetRecord {
   name: string;
   serialNumber: string;
   category: AssetCategory;
+  currency: CurrencyCode;
   purchasePrice: number;
   currentValuation: number;
   purchaseDate: string;
@@ -81,6 +84,7 @@ export interface AssetFormInput {
   name: string;
   serialNumber: string;
   category: AssetCategory;
+  currency: CurrencyCode;
   purchasePrice: number;
   currentValuation: number;
   purchaseDate: string;
@@ -104,25 +108,11 @@ export interface AssetEventRecord {
   hasPendingWrites?: boolean;
 }
 
-export function formatCurrency(amount: number): string {
-  return new Intl.NumberFormat('en-US', {
-    style: 'currency',
-    currency: 'USD',
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  }).format(Number.isFinite(amount) ? amount : 0);
-}
-
-export function formatCompactCurrency(amount: number): string {
-  if (!Number.isFinite(amount)) return '$0';
-  if (Math.abs(amount) >= 1_000_000) {
-    return `$${(amount / 1_000_000).toFixed(2)}M`;
-  }
-  return new Intl.NumberFormat('en-US', {
-    style: 'currency',
-    currency: 'USD',
-    maximumFractionDigits: 0,
-  }).format(amount);
+export function formatCurrency(
+  amount: number,
+  currencyCode: CurrencyCode = 'USD'
+): string {
+  return formatMoney(amount, currencyCode);
 }
 
 export function formatShortDate(isoOrDate: string | Date): string {
@@ -179,6 +169,7 @@ export const SAMPLE_STARTER_ASSETS: AssetFormInput[] = [
     name: 'Dell Latitude 7450 Workstation Bundle',
     serialNumber: 'AT-IT-745088',
     category: 'IT Hardware',
+    currency: 'USD',
     purchasePrice: 2890,
     currentValuation: 2540,
     purchaseDate: getTodayIsoDate(),
@@ -194,13 +185,14 @@ export const SAMPLE_STARTER_ASSETS: AssetFormInput[] = [
     name: 'ErgoPro Executive Mesh Task Chair',
     serialNumber: 'AT-FN-309214',
     category: 'Office Furniture',
-    purchasePrice: 1180,
-    currentValuation: 960,
+    currency: 'EUR',
+    purchasePrice: 1090,
+    currentValuation: 890,
     purchaseDate: '2026-06-12',
     warrantyExpiry: '2031-06-12',
     status: 'Available',
-    department: 'Workplace Operations',
-    location: 'HQ Floor 2 · Storage Suite B',
+    department: 'EMEA Operations',
+    location: 'Berlin Hub · Suite B',
     assignedTo: '',
     notes: 'Polished aluminum base, lumbar support inspected Q3.',
     photoUrl: chairImg,
@@ -209,13 +201,14 @@ export const SAMPLE_STARTER_ASSETS: AssetFormInput[] = [
     name: 'Ford E-Transit Electric Cargo Van #07',
     serialNumber: 'AT-VH-904512',
     category: 'Vehicles',
-    purchasePrice: 54200,
-    currentValuation: 48750,
+    currency: 'GBP',
+    purchasePrice: 42800,
+    currentValuation: 38500,
     purchaseDate: getTodayIsoDate(),
     warrantyExpiry: '2030-09-30',
     status: 'In Use',
     department: 'Regional Logistics',
-    location: 'Distribution Hub · Bay 07',
+    location: 'London Depot · Bay 07',
     assignedTo: 'Marcus Vance',
     notes: '68 kWh battery pack, Level 2 fleet charger assigned to Bay 07.',
     photoUrl: vanImg,
@@ -224,6 +217,7 @@ export const SAMPLE_STARTER_ASSETS: AssetFormInput[] = [
     name: 'Prism Precision 500 Fiber Laser Unit',
     serialNumber: 'AT-MC-500319',
     category: 'Machinery',
+    currency: 'USD',
     purchasePrice: 38500,
     currentValuation: 34100,
     purchaseDate: '2026-03-20',

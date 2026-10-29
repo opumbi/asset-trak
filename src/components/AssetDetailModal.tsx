@@ -13,6 +13,12 @@ import {
 } from 'lucide-react';
 import { db, handleFirestoreError, OperationType } from '../lib/firebase';
 import {
+  convertCurrency,
+  CURRENCY_META,
+  CurrencyCode,
+  SUPPORTED_CURRENCIES,
+} from '../lib/currency';
+import {
   ASSET_STATUSES,
   AssetEventAction,
   AssetEventRecord,
@@ -27,16 +33,24 @@ import { AssetImage } from './AssetImage';
 interface AssetDetailModalProps {
   asset: AssetRecord | null;
   userId: string;
+  reportingCurrency: CurrencyCode;
+  usdRates: Record<CurrencyCode, number>;
   onClose: () => void;
   onEdit: (asset: AssetRecord) => void;
   onStatusChange: (asset: AssetRecord, nextStatus: AssetStatus) => Promise<void>;
-  onValuationChange: (asset: AssetRecord, nextValuation: number) => Promise<void>;
+  onValuationChange: (
+    asset: AssetRecord,
+    nextValuation: number,
+    nextCurrency: CurrencyCode
+  ) => Promise<void>;
   onDelete: (assetId: string) => Promise<void>;
 }
 
 export function AssetDetailModal({
   asset,
   userId,
+  reportingCurrency,
+  usdRates,
   onClose,
   onEdit,
   onStatusChange,
@@ -52,6 +66,7 @@ export function AssetDetailModal({
   const [isUpdating, setIsUpdating] = useState(false);
   const [editingValuation, setEditingValuation] = useState(false);
   const [valuationDraft, setValuationDraft] = useState('');
+  const [currencyDraft, setCurrencyDraft] = useState<CurrencyCode>('USD');
   const [actionError, setActionError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -66,6 +81,7 @@ export function AssetDetailModal({
     }
 
     setValuationDraft(String(asset.currentValuation));
+    setCurrencyDraft(asset.currency || 'USD');
     setLoadingEvents(true);
     const eventsPath = `assets/${asset.assetId}/events`;
     const eventsQuery = query(
@@ -102,7 +118,7 @@ export function AssetDetailModal({
     );
 
     return () => unsubscribe();
-  }, [asset?.assetId, userId]);
+  }, [asset?.assetId, asset?.currentValuation, asset?.currency, userId]);
 
   if (!asset) return null;
 
@@ -112,6 +128,11 @@ export function AssetDetailModal({
     asset.purchasePrice > 0
       ? Math.round((asset.currentValuation / asset.purchasePrice) * 100)
       : 100;
+
+  const convertedValuation =
+    asset.currency !== reportingCurrency
+      ? convertCurrency(asset.currentValuation, asset.currency, reportingCurrency, usdRates)
+      : null;
 
   const handleQuickStatus = async (targetStatus: AssetStatus) => {
     if (targetStatus === asset.status || isDisposed) return;
@@ -140,7 +161,7 @@ export function AssetDetailModal({
     setActionError(null);
     setIsUpdating(true);
     try {
-      await onValuationChange(asset, parsed);
+      await onValuationChange(asset, parsed, currencyDraft);
       setEditingValuation(false);
     } catch (err) {
       setActionError(err instanceof Error ? err.message : 'Valuation update failed.');
@@ -226,6 +247,8 @@ export function AssetDetailModal({
               <span aria-hidden="true">·</span>
               <span className="font-mono text-slate-700">{asset.serialNumber}</span>
               <span aria-hidden="true">·</span>
+              <span className="font-mono">{asset.currency}</span>
+              <span aria-hidden="true">·</span>
               <span className="inline-flex items-center gap-1">
                 {asset.hasPendingWrites ? (
                   <>
@@ -290,7 +313,9 @@ export function AssetDetailModal({
               <div className="space-y-4">
                 <div>
                   <div className="flex items-center justify-between">
-                    <span className="text-xs text-slate-500">Current Valuation</span>
+                    <span className="text-xs text-slate-500">
+                      Current Valuation ({asset.currency})
+                    </span>
                     {!isDisposed && !editingValuation && (
                       <button
                         type="button"
@@ -303,43 +328,71 @@ export function AssetDetailModal({
                   </div>
 
                   {editingValuation ? (
-                    <div className="flex items-center gap-2 mt-1.5">
-                      <input
-                        type="number"
-                        min="0"
-                        step="0.01"
-                        value={valuationDraft}
-                        onChange={(e) => setValuationDraft(e.target.value)}
-                        className="w-full min-h-[40px] px-3 py-1.5 text-sm font-mono tabular-nums border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-600"
-                      />
-                      <button
-                        type="button"
-                        disabled={isUpdating}
-                        onClick={() => void handleSaveValuation()}
-                        className="min-h-[40px] px-3 py-1.5 text-xs font-medium bg-slate-900 text-white rounded-lg hover:bg-slate-800 whitespace-nowrap shrink-0"
-                      >
-                        Save
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setEditingValuation(false);
-                          setValuationDraft(String(asset.currentValuation));
-                        }}
-                        className="min-h-[40px] px-2.5 py-1.5 text-xs text-slate-600 hover:text-slate-900 whitespace-nowrap shrink-0"
-                      >
-                        Cancel
-                      </button>
+                    <div className="space-y-2 mt-1.5">
+                      <div className="flex items-center gap-2">
+                        <select
+                          value={currencyDraft}
+                          onChange={(e) => setCurrencyDraft(e.target.value as CurrencyCode)}
+                          aria-label="Currency denomination"
+                          className="min-h-[40px] px-2.5 py-1.5 text-xs font-mono bg-white border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-600 shrink-0"
+                        >
+                          {SUPPORTED_CURRENCIES.map((ccy) => (
+                            <option key={ccy} value={ccy}>
+                              {ccy}
+                            </option>
+                          ))}
+                        </select>
+                        <input
+                          type="number"
+                          min="0"
+                          step={CURRENCY_META[currencyDraft].zeroDecimal ? '1' : '0.01'}
+                          value={valuationDraft}
+                          onChange={(e) => setValuationDraft(e.target.value)}
+                          className="w-full min-h-[40px] px-3 py-1.5 text-sm font-mono tabular-nums border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-600"
+                        />
+                      </div>
+                      <div className="flex items-center justify-end gap-2">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setEditingValuation(false);
+                            setValuationDraft(String(asset.currentValuation));
+                            setCurrencyDraft(asset.currency);
+                          }}
+                          className="min-h-[36px] px-2.5 py-1 text-xs text-slate-600 hover:text-slate-900 whitespace-nowrap"
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          type="button"
+                          disabled={isUpdating}
+                          onClick={() => void handleSaveValuation()}
+                          className="min-h-[36px] px-3.5 py-1 text-xs font-medium bg-slate-900 text-white rounded-lg hover:bg-slate-800 whitespace-nowrap"
+                        >
+                          Save Valuation
+                        </button>
+                      </div>
                     </div>
                   ) : (
-                    <div className="text-2xl font-bold font-mono tabular-nums text-slate-900 mt-0.5">
-                      {formatCurrency(asset.currentValuation)}
-                    </div>
+                    <>
+                      <div className="text-2xl font-bold font-mono tabular-nums text-slate-900 mt-0.5">
+                        {formatCurrency(asset.currentValuation, asset.currency)}
+                      </div>
+                      {convertedValuation !== null && (
+                        <div className="text-xs font-mono tabular-nums text-blue-700 mt-0.5">
+                          ≈ {formatCurrency(convertedValuation, reportingCurrency)} ({reportingCurrency})
+                        </div>
+                      )}
+                    </>
                   )}
 
-                  <div className="text-xs text-slate-500 mt-1 font-mono tabular-nums">
-                    Acquired {formatCurrency(asset.purchasePrice)} · {retentionPct}% book value (
-                    {netDelta >= 0 ? `+${formatCurrency(netDelta)}` : formatCurrency(netDelta)})
+                  <div className="text-xs text-slate-500 mt-1.5 font-mono tabular-nums">
+                    Acquired {formatCurrency(asset.purchasePrice, asset.currency)} · {retentionPct}%
+                    book value (
+                    {netDelta >= 0
+                      ? `+${formatCurrency(netDelta, asset.currency)}`
+                      : formatCurrency(netDelta, asset.currency)}
+                    )
                   </div>
                 </div>
 

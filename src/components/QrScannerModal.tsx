@@ -327,7 +327,7 @@ export function QrScannerModal({
                         <span>{matchedAsset.status}</span>
                         <span aria-hidden="true">·</span>
                         <span className="font-mono tabular-nums">
-                          {formatCurrency(matchedAsset.currentValuation)}
+                          {formatCurrency(matchedAsset.currentValuation, matchedAsset.currency)}
                         </span>
                       </div>
                     </div>

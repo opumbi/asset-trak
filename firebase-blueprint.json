@@ -2,7 +2,7 @@
   "entities": {
     "Asset": {
       "title": "Asset",
-      "description": "A physical or capital corporate asset tracked in inventory with valuation, assignment, lifecycle status, and photo.",
+      "description": "A physical or capital corporate asset tracked in inventory with multicurrency valuation, assignment, lifecycle status, and photo.",
       "type": "object",
       "properties": {
         "assetId": {
@@ -44,13 +44,33 @@
           ],
           "maxLength": 40
         },
+        "currency": {
+          "type": "string",
+          "description": "ISO 4217 3-letter currency code in which purchase price and valuation are denominated.",
+          "enum": [
+            "USD",
+            "EUR",
+            "GBP",
+            "CAD",
+            "AUD",
+            "JPY",
+            "CHF",
+            "INR",
+            "SGD",
+            "ZAR",
+            "NGN",
+            "BRL"
+          ],
+          "minLength": 3,
+          "maxLength": 3
+        },
         "purchasePrice": {
           "type": "number",
-          "description": "Original acquisition price in USD."
+          "description": "Original acquisition price in the asset's native currency."
         },
         "currentValuation": {
           "type": "number",
-          "description": "Current book or market valuation in USD."
+          "description": "Current book or market valuation in the asset's native currency."
         },
         "purchaseDate": {
           "type": "string",
@@ -124,6 +144,7 @@
         "name",
         "serialNumber",
         "category",
+        "currency",
         "purchasePrice",
         "currentValuation",
         "purchaseDate",
@@ -203,6 +224,50 @@
         "actorEmail",
         "createdAt"
       ]
+    },
+    "UserSettings": {
+      "title": "UserSettings",
+      "description": "Per-user workspace preferences such as consolidated portfolio reporting currency.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "Firebase Auth UID matching the settings document ID.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "reportingCurrency": {
+          "type": "string",
+          "description": "ISO 4217 currency code used to consolidate portfolio KPIs and reports.",
+          "enum": [
+            "USD",
+            "EUR",
+            "GBP",
+            "CAD",
+            "AUD",
+            "JPY",
+            "CHF",
+            "INR",
+            "SGD",
+            "ZAR",
+            "NGN",
+            "BRL"
+          ],
+          "minLength": 3,
+          "maxLength": 3
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when workspace preferences were updated."
+        }
+      },
+      "required": [
+        "userId",
+        "reportingCurrency",
+        "updatedAt"
+      ]
     }
   },
   "firestore": {
@@ -210,13 +275,19 @@
       "schema": {
         "$ref": "#/entities/Asset"
       },
-      "description": "Primary corporate inventory collection storing tracked assets scoped to their authenticated owner."
+      "description": "Primary corporate inventory collection storing tracked assets with native currency scoped to their authenticated owner."
     },
     "/assets/{assetId}/events/{eventId}": {
       "schema": {
         "$ref": "#/entities/AssetEvent"
       },
-      "description": "Append-only subcollection recording timestamped lifecycle and valuation audit events for each asset."
+      "description": "Append-only subcollection recording timestamped lifecycle and multicurrency valuation audit events for each asset."
+    },
+    "/userSettings/{userId}": {
+      "schema": {
+        "$ref": "#/entities/UserSettings"
+      },
+      "description": "Owner-isolated workspace configuration storing preferred portfolio reporting currency."
     }
   }
 }

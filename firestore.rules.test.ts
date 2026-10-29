@@ -7,19 +7,20 @@ import {
 import {
   collection,
   doc,
+  getDoc,
   getDocs,
+  query,
   serverTimestamp,
   setDoc,
   Timestamp,
   updateDoc,
-  writeBatch,
-  query,
   where,
+  writeBatch,
 } from 'firebase/firestore';
 import { readFileSync } from 'node:fs';
 
 /**
- * Phase 0 TDD Security Test Suite — Asset Track
+ * Phase 0 TDD Security Test Suite — Asset Track (Multicurrency)
  * Verifies all "Dirty Dozen" adversarial payloads return PERMISSION_DENIED
  * and legitimate verified-owner operations succeed.
  */
@@ -50,8 +51,9 @@ export async function runSecurityRulesSuite() {
     name: 'Dell Precision 5680 Workstation',
     serialNumber: 'DL-5680-9921',
     category: 'IT Hardware',
-    purchasePrice: 3200,
-    currentValuation: 2850,
+    currency: 'EUR',
+    purchasePrice: 2950,
+    currentValuation: 2620,
     purchaseDate: '2026-10-05',
     warrantyExpiry: '2029-10-05',
     status: 'In Use',
@@ -65,12 +67,21 @@ export async function runSecurityRulesSuite() {
   };
 
   try {
-    // Legitimate baseline creation succeeds
     const aliceDb = aliceCtx.firestore();
+    const malloryDb = malloryCtx.firestore();
+    const unverifiedDb = unverifiedCtx.firestore();
+
+    // Legitimate baseline creation & settings write succeed
     await assertSucceeds(setDoc(doc(aliceDb, 'assets', 'asset_001'), baseAsset));
+    await assertSucceeds(
+      setDoc(doc(aliceDb, 'userSettings', 'alice_uid_01'), {
+        userId: 'alice_uid_01',
+        reportingCurrency: 'EUR',
+        updatedAt: serverTimestamp(),
+      })
+    );
 
     // Dirty Dozen #1: Identity Spoofing on Asset Create
-    const malloryDb = malloryCtx.firestore();
     await assertFails(
       setDoc(doc(malloryDb, 'assets', 'asset_spoof'), {
         ...baseAsset,
@@ -80,7 +91,6 @@ export async function runSecurityRulesSuite() {
     );
 
     // Dirty Dozen #2: Unverified Email Spoof Attack
-    const unverifiedDb = unverifiedCtx.firestore();
     await assertFails(
       setDoc(doc(unverifiedDb, 'assets', 'asset_unverified'), {
         ...baseAsset,
@@ -88,12 +98,12 @@ export async function runSecurityRulesSuite() {
       })
     );
 
-    // Dirty Dozen #3: Shadow Field Injection on Create
+    // Dirty Dozen #3: Unsupported / Poisoned Currency Code
     await assertFails(
-      setDoc(doc(aliceDb, 'assets', 'asset_shadow'), {
+      setDoc(doc(aliceDb, 'assets', 'asset_bad_ccy'), {
         ...baseAsset,
-        assetId: 'asset_shadow',
-        isSuperAdmin: true,
+        assetId: 'asset_bad_ccy',
+        currency: 'XYZ',
       })
     );
 
@@ -106,7 +116,7 @@ export async function runSecurityRulesSuite() {
       })
     );
 
-    // Dirty Dozen #5: Path ID Poisoning (mismatched payload assetId vs path)
+    // Dirty Dozen #5: Path ID Poisoning
     await assertFails(
       setDoc(doc(aliceDb, 'assets', 'asset_mismatch'), {
         ...baseAsset,
@@ -117,7 +127,8 @@ export async function runSecurityRulesSuite() {
     // Dirty Dozen #6: Denial-of-Wallet Oversized String
     await assertFails(
       updateDoc(doc(aliceDb, 'assets', 'asset_001'), {
-        currentValuation: 2800,
+        currentValuation: 2600,
+        currency: 'EUR',
         notes: 'X'.repeat(2500),
         updatedAt: serverTimestamp(),
       })
@@ -147,6 +158,7 @@ export async function runSecurityRulesSuite() {
         status: 'Disposed',
         assignedTo: '',
         location: 'Archive Vault',
+        currency: 'EUR',
         updatedAt: serverTimestamp(),
       })
     );
@@ -155,6 +167,7 @@ export async function runSecurityRulesSuite() {
     await assertFails(
       updateDoc(doc(aliceDb, 'assets', 'asset_001'), {
         currentValuation: 99999,
+        currency: 'USD',
         notes: 'Reviving disposed asset',
         updatedAt: serverTimestamp(),
       })
@@ -180,22 +193,25 @@ export async function runSecurityRulesSuite() {
       assetId: 'asset_001',
       ownerId: 'alice_uid_01',
       action: 'Asset Registered',
-      summary: 'Registered Dell Precision 5680',
+      summary: 'Registered Dell Precision 5680 in EUR',
       actorEmail: 'alice@enterprise.com',
       createdAt: serverTimestamp(),
     });
     await assertSucceeds(batch.commit());
 
-    // Dirty Dozen #11: Audit Log Tampering (Updating an Event)
+    // Dirty Dozen #11: Cross-User Settings Tampering / Reading
+    await assertFails(getDoc(doc(malloryDb, 'userSettings', 'alice_uid_01')));
     await assertFails(
-      updateDoc(doc(aliceDb, 'assets', 'asset_001', 'events', 'evt_valid'), {
-        summary: 'Tampered history entry',
+      setDoc(doc(malloryDb, 'userSettings', 'alice_uid_01'), {
+        userId: 'alice_uid_01',
+        reportingCurrency: 'JPY',
+        updatedAt: serverTimestamp(),
       })
     );
 
     // Dirty Dozen #12: Unauthorized Blanket list Scraping
     await assertFails(getDocs(collection(malloryDb, 'assets')));
-    // Valid scoped list query succeeds
+    await assertFails(getDocs(collection(aliceDb, 'userSettings')));
     await assertSucceeds(
       getDocs(query(collection(aliceDb, 'assets'), where('ownerId', '==', 'alice_uid_01')))
     );

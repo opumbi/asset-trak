@@ -4,11 +4,20 @@ import {
   getDocs,
   query,
   serverTimestamp,
+  setDoc,
   where,
   WriteBatch,
   writeBatch,
 } from 'firebase/firestore';
 import { db, handleFirestoreError, OperationType } from '../lib/firebase';
+import {
+  cacheReportingCurrencyLocally,
+  convertCurrency,
+  CURRENCY_META,
+  CurrencyCode,
+  getCrossRate,
+  isValidCurrencyCode,
+} from '../lib/currency';
 import {
   ASSET_CATEGORIES,
   ASSET_STATUSES,
@@ -27,6 +36,7 @@ export interface ValidatedAssetPayload {
   name: string;
   serialNumber: string;
   category: AssetCategory;
+  currency: CurrencyCode;
   purchasePrice: number;
   currentValuation: number;
   purchaseDate: string;
@@ -40,7 +50,7 @@ export interface ValidatedAssetPayload {
 }
 
 /**
- * Enforces blueprint volumetric and regex constraints on outgoing mutations
+ * Enforces blueprint volumetric, ISO currency, and regex constraints on outgoing mutations
  * prior to Firestore execution (Validation Synchronicity).
  */
 export function sanitizeAndValidateAssetInput(input: AssetFormInput): ValidatedAssetPayload {
@@ -58,9 +68,17 @@ export function sanitizeAndValidateAssetInput(input: AssetFormInput): ValidatedA
     throw new Error('Please select a valid asset category.');
   }
 
+  if (!isValidCurrencyCode(input.currency)) {
+    throw new Error('Please select a supported ISO currency.');
+  }
+
   if (!ASSET_STATUSES.includes(input.status)) {
     throw new Error('Please select a valid lifecycle status.');
   }
+
+  const isZeroDec = Boolean(CURRENCY_META[input.currency].zeroDecimal);
+  const roundMoney = (val: number) =>
+    isZeroDec ? Math.round(val) : Math.round(val * 100) / 100;
 
   const purchasePrice = Number(input.purchasePrice);
   if (
@@ -68,7 +86,7 @@ export function sanitizeAndValidateAssetInput(input: AssetFormInput): ValidatedA
     purchasePrice < 0 ||
     purchasePrice > SCHEMA_LIMITS.MAX_MONETARY_VALUE
   ) {
-    throw new Error('Purchase price must be between $0 and $1,000,000,000.');
+    throw new Error('Purchase price must be between 0 and 1,000,000,000.');
   }
 
   const currentValuation = Number(input.currentValuation);
@@ -77,7 +95,7 @@ export function sanitizeAndValidateAssetInput(input: AssetFormInput): ValidatedA
     currentValuation < 0 ||
     currentValuation > SCHEMA_LIMITS.MAX_MONETARY_VALUE
   ) {
-    throw new Error('Current valuation must be between $0 and $1,000,000,000.');
+    throw new Error('Current valuation must be between 0 and 1,000,000,000.');
   }
 
   const purchaseDate = input.purchaseDate.trim();
@@ -111,8 +129,9 @@ export function sanitizeAndValidateAssetInput(input: AssetFormInput): ValidatedA
     name,
     serialNumber,
     category: input.category,
-    purchasePrice: Math.round(purchasePrice * 100) / 100,
-    currentValuation: Math.round(currentValuation * 100) / 100,
+    currency: input.currency,
+    purchasePrice: roundMoney(purchasePrice),
+    currentValuation: roundMoney(currentValuation),
     purchaseDate,
     warrantyExpiry,
     status: input.status,
@@ -170,6 +189,36 @@ function appendAuditEventToBatch(
   });
 }
 
+export async function saveUserReportingCurrency(params: {
+  userId: string;
+  reportingCurrency: CurrencyCode;
+  isOnline: boolean;
+}): Promise<void> {
+  if (!isValidCurrencyCode(params.reportingCurrency)) {
+    throw new Error('Unsupported reporting currency.');
+  }
+
+  cacheReportingCurrencyLocally(params.reportingCurrency);
+  const path = `userSettings/${params.userId}`;
+  const writePromise = setDoc(doc(db, 'userSettings', params.userId), {
+    userId: params.userId,
+    reportingCurrency: params.reportingCurrency,
+    updatedAt: serverTimestamp(),
+  }).catch((error) => {
+    handleFirestoreError(error, OperationType.WRITE, path);
+  });
+
+  if (!params.isOnline) {
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    return;
+  }
+
+  await Promise.race([
+    writePromise,
+    new Promise<void>((resolve) => setTimeout(resolve, 2500)),
+  ]);
+}
+
 export async function createAssetWithEvent(params: {
   input: AssetFormInput;
   ownerId: string;
@@ -196,8 +245,9 @@ export async function createAssetWithEvent(params: {
     actorEmail: params.actorEmail,
     action: 'Asset Registered',
     summary: `Registered in ${validated.category} at ${formatCurrency(
-      validated.currentValuation
-    )}${assigneeNote}`,
+      validated.currentValuation,
+      validated.currency
+    )} (${validated.currency})${assigneeNote}`,
   });
 
   const syncState = await commitBatchOfflineAware(
@@ -228,6 +278,7 @@ export async function updateFullAssetWithEvent(params: {
     name: validated.name,
     serialNumber: validated.serialNumber,
     category: validated.category,
+    currency: validated.currency,
     purchasePrice: validated.purchasePrice,
     currentValuation: validated.currentValuation,
     purchaseDate: validated.purchaseDate,
@@ -248,12 +299,16 @@ export async function updateFullAssetWithEvent(params: {
     action = 'Status Changed';
     changes.push(`Status ${params.existing.status} -> ${validated.status}`);
   }
-  if (params.existing.currentValuation !== validated.currentValuation) {
+  if (
+    params.existing.currentValuation !== validated.currentValuation ||
+    params.existing.currency !== validated.currency
+  ) {
     if (action === 'Details Updated') action = 'Valuation Adjusted';
     changes.push(
-      `Valuation ${formatCurrency(params.existing.currentValuation)} -> ${formatCurrency(
-        validated.currentValuation
-      )}`
+      `Valuation ${formatCurrency(
+        params.existing.currentValuation,
+        params.existing.currency
+      )} -> ${formatCurrency(validated.currentValuation, validated.currency)}`
     );
   }
   if (params.existing.photoUrl !== validated.photoUrl) {
@@ -307,6 +362,9 @@ export async function updateAssetStatusAction(params: {
   const nextLocation = (params.location ?? params.existing.location)
     .trim()
     .slice(0, SCHEMA_LIMITS.LOCATION_MAX_LEN);
+  const safeCurrency: CurrencyCode = isValidCurrencyCode(params.existing.currency)
+    ? params.existing.currency
+    : 'USD';
 
   if (!nextLocation) {
     throw new Error('Location cannot be empty.');
@@ -319,6 +377,7 @@ export async function updateAssetStatusAction(params: {
     status: params.newStatus,
     assignedTo: nextAssignedTo,
     location: nextLocation,
+    currency: safeCurrency,
     updatedAt: serverTimestamp(),
   });
 
@@ -341,6 +400,7 @@ export async function updateAssetStatusAction(params: {
 export async function updateAssetValuationAction(params: {
   existing: AssetRecord;
   newValuation: number;
+  newCurrency?: CurrencyCode;
   notes?: string;
   ownerId: string;
   actorEmail: string;
@@ -350,13 +410,24 @@ export async function updateAssetValuationAction(params: {
     throw new Error('Disposed assets have finalized lifecycle records and cannot be revalued.');
   }
 
-  const cleanVal = Math.round(Number(params.newValuation) * 100) / 100;
+  const targetCurrency: CurrencyCode =
+    params.newCurrency && isValidCurrencyCode(params.newCurrency)
+      ? params.newCurrency
+      : isValidCurrencyCode(params.existing.currency)
+      ? params.existing.currency
+      : 'USD';
+
+  const isZeroDec = Boolean(CURRENCY_META[targetCurrency].zeroDecimal);
+  const cleanVal = isZeroDec
+    ? Math.round(Number(params.newValuation))
+    : Math.round(Number(params.newValuation) * 100) / 100;
+
   if (
     !Number.isFinite(cleanVal) ||
     cleanVal < 0 ||
     cleanVal > SCHEMA_LIMITS.MAX_MONETARY_VALUE
   ) {
-    throw new Error('Valuation must be between $0 and $1,000,000,000.');
+    throw new Error('Valuation must be between 0 and 1,000,000,000.');
   }
 
   const nextNotes = (params.notes ?? params.existing.notes)
@@ -368,6 +439,7 @@ export async function updateAssetValuationAction(params: {
 
   batch.update(assetRef, {
     currentValuation: cleanVal,
+    currency: targetCurrency,
     notes: nextNotes,
     updatedAt: serverTimestamp(),
   });
@@ -378,8 +450,9 @@ export async function updateAssetValuationAction(params: {
     actorEmail: params.actorEmail,
     action: 'Valuation Adjusted',
     summary: `Book valuation updated from ${formatCurrency(
-      params.existing.currentValuation
-    )} to ${formatCurrency(cleanVal)}`,
+      params.existing.currentValuation,
+      params.existing.currency
+    )} to ${formatCurrency(cleanVal, targetCurrency)} (${targetCurrency})`,
   });
 
   return commitBatchOfflineAware(
@@ -446,24 +519,33 @@ export async function seedSampleAssets(params: {
       actorEmail: params.actorEmail,
       action: 'Asset Registered',
       summary: `Initial catalog registration in ${validated.category} (${formatCurrency(
-        validated.currentValuation
-      )})`,
+        validated.currentValuation,
+        validated.currency
+      )} ${validated.currency})`,
     });
   }
 
   return commitBatchOfflineAware(batch, OperationType.CREATE, 'assets', params.isOnline);
 }
 
-export function exportAssetsToCsv(assets: AssetRecord[]): void {
+export function exportAssetsToCsv(
+  assets: AssetRecord[],
+  reportingCurrency: CurrencyCode,
+  usdRates: Record<CurrencyCode, number>
+): void {
   const headers = [
     'Asset ID',
     'Asset Name',
     'Serial / Model Number',
     'Category',
     'Status',
-    'Purchase Price (USD)',
-    'Current Valuation (USD)',
-    'Net Depreciation (USD)',
+    'Native Currency',
+    'Purchase Price (Native)',
+    'Current Valuation (Native)',
+    `Reporting Currency (${reportingCurrency})`,
+    'FX Conversion Rate',
+    `Converted Purchase (${reportingCurrency})`,
+    `Converted Valuation (${reportingCurrency})`,
     'Purchase Date',
     'Warranty Expiry',
     'Department',
@@ -483,16 +565,35 @@ export function exportAssetsToCsv(assets: AssetRecord[]): void {
   };
 
   const rows = assets.map((asset) => {
-    const depreciation = Math.round((asset.currentValuation - asset.purchasePrice) * 100) / 100;
+    const fxRate = getCrossRate(asset.currency, reportingCurrency, usdRates);
+    const convertedPurchase = convertCurrency(
+      asset.purchasePrice,
+      asset.currency,
+      reportingCurrency,
+      usdRates
+    );
+    const convertedValuation = convertCurrency(
+      asset.currentValuation,
+      asset.currency,
+      reportingCurrency,
+      usdRates
+    );
+    const nativeDecimals = CURRENCY_META[asset.currency]?.zeroDecimal ? 0 : 2;
+    const reportDecimals = CURRENCY_META[reportingCurrency]?.zeroDecimal ? 0 : 2;
+
     return [
       asset.assetId,
       asset.name,
       asset.serialNumber,
       asset.category,
       asset.status,
-      asset.purchasePrice.toFixed(2),
-      asset.currentValuation.toFixed(2),
-      depreciation.toFixed(2),
+      asset.currency,
+      asset.purchasePrice.toFixed(nativeDecimals),
+      asset.currentValuation.toFixed(nativeDecimals),
+      reportingCurrency,
+      fxRate.toFixed(4),
+      convertedPurchase.toFixed(reportDecimals),
+      convertedValuation.toFixed(reportDecimals),
       asset.purchaseDate,
       asset.warrantyExpiry || 'N/A',
       asset.department,
@@ -512,7 +613,10 @@ export function exportAssetsToCsv(assets: AssetRecord[]): void {
   const link = document.createElement('a');
   const dateStamp = new Date().toISOString().slice(0, 10);
   link.href = url;
-  link.setAttribute('download', `asset-track-inventory-${dateStamp}.csv`);
+  link.setAttribute(
+    'download',
+    `asset-track-inventory-${reportingCurrency.toLowerCase()}-${dateStamp}.csv`
+  );
   document.body.appendChild(link);
   link.click();
   document.body.removeChild(link);

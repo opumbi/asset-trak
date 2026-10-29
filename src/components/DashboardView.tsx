@@ -13,6 +13,7 @@ import {
   QrCode,
   Wrench,
 } from 'lucide-react';
+import { convertCurrency, CurrencyCode } from '../lib/currency';
 import {
   ASSET_CATEGORIES,
   ASSET_STATUSES,
@@ -25,6 +26,8 @@ import { AssetImage } from './AssetImage';
 
 interface DashboardViewProps {
   assets: AssetRecord[];
+  reportingCurrency: CurrencyCode;
+  usdRates: Record<CurrencyCode, number>;
   isLoading: boolean;
   isSeeding: boolean;
   onOpenAddAsset: () => void;
@@ -50,6 +53,8 @@ function StatusRowIcon({ status }: { status: AssetStatus }) {
 
 export function DashboardView({
   assets,
+  reportingCurrency,
+  usdRates,
   isLoading,
   isSeeding,
   onOpenAddAsset,
@@ -71,11 +76,26 @@ export function DashboardView({
     let addedThisMonthValue = 0;
     let activeCount = 0;
     let maintenanceCount = 0;
+    const distinctCurrencies = new Set<CurrencyCode>();
 
     for (const a of assets) {
+      distinctCurrencies.add(a.currency);
+      const valInBase = convertCurrency(
+        a.currentValuation,
+        a.currency,
+        reportingCurrency,
+        usdRates
+      );
+      const costInBase = convertCurrency(
+        a.purchasePrice,
+        a.currency,
+        reportingCurrency,
+        usdRates
+      );
+
       if (a.status !== 'Disposed') {
-        totalValuation += a.currentValuation;
-        totalPurchaseCost += a.purchasePrice;
+        totalValuation += valInBase;
+        totalPurchaseCost += costInBase;
         activeCount += 1;
       }
       if (a.status === 'Maintenance') {
@@ -89,7 +109,7 @@ export function DashboardView({
 
       if (createdThisMonth || purchasedThisMonth) {
         addedThisMonthCount += 1;
-        addedThisMonthValue += a.currentValuation;
+        addedThisMonthValue += valInBase;
       }
     }
 
@@ -97,7 +117,12 @@ export function DashboardView({
       const matching = assets.filter((a) => a.category === category);
       const valuation = matching
         .filter((a) => a.status !== 'Disposed')
-        .reduce((sum, item) => sum + item.currentValuation, 0);
+        .reduce(
+          (sum, item) =>
+            sum +
+            convertCurrency(item.currentValuation, item.currency, reportingCurrency, usdRates),
+          0
+        );
       const sharePct =
         totalValuation > 0 ? Math.round((valuation / totalValuation) * 100) : 0;
       return {
@@ -110,7 +135,12 @@ export function DashboardView({
 
     const statusStats = ASSET_STATUSES.map((status) => {
       const matching = assets.filter((a) => a.status === status);
-      const valuation = matching.reduce((sum, item) => sum + item.currentValuation, 0);
+      const valuation = matching.reduce(
+        (sum, item) =>
+          sum +
+          convertCurrency(item.currentValuation, item.currency, reportingCurrency, usdRates),
+        0
+      );
       const sharePct =
         assets.length > 0 ? Math.round((matching.length / assets.length) * 100) : 0;
       return {
@@ -129,10 +159,11 @@ export function DashboardView({
       totalPurchaseCost,
       addedThisMonthCount,
       addedThisMonthValue,
+      currencyCount: distinctCurrencies.size,
       categoryStats,
       statusStats,
     };
-  }, [assets]);
+  }, [assets, reportingCurrency, usdRates]);
 
   if (isLoading) {
     return (
@@ -158,7 +189,9 @@ export function DashboardView({
             Executive Inventory Overview
           </h1>
           <p className="text-sm text-slate-600 mt-1">
-            Real-time capital valuation, custody tracking, and lifecycle audit status across all departments.
+            Consolidated portfolio valuation in{' '}
+            <span className="font-mono font-semibold text-slate-900">{reportingCurrency}</span>{' '}
+            across all native transaction currencies and departments.
           </p>
         </div>
 
@@ -194,7 +227,7 @@ export function DashboardView({
         </div>
       </div>
 
-      {/* Top Executive KPI Strip (Single-Elevation Container with Hairline Dividers) */}
+      {/* Top Executive KPI Strip */}
       <section
         aria-label="Key Inventory Metrics"
         className="bg-white border border-slate-200 rounded-2xl grid grid-cols-1 md:grid-cols-3 divide-y md:divide-y-0 md:divide-x divide-slate-200"
@@ -209,19 +242,21 @@ export function DashboardView({
           <div className="text-xs text-slate-500 mt-2 flex items-center gap-1.5 font-mono tabular-nums">
             <span>{metrics.activeCount} active</span>
             <span aria-hidden="true">·</span>
-            <span>{metrics.maintenanceCount} in maintenance</span>
+            <span>
+              {metrics.currencyCount} {metrics.currencyCount === 1 ? 'currency' : 'currencies'}
+            </span>
           </div>
         </div>
 
         <div className="p-6">
           <div className="text-xs font-medium text-slate-500">
-            Total Portfolio Valuation
+            Total Portfolio Valuation ({reportingCurrency})
           </div>
           <div className="text-3xl font-bold font-mono tabular-nums text-slate-900 mt-2">
-            {formatCurrency(metrics.totalValuation)}
+            {formatCurrency(metrics.totalValuation, reportingCurrency)}
           </div>
           <div className="text-xs text-slate-500 mt-2 font-mono tabular-nums">
-            Acquisition basis {formatCurrency(metrics.totalPurchaseCost)}
+            Acquisition basis {formatCurrency(metrics.totalPurchaseCost, reportingCurrency)}
           </div>
         </div>
 
@@ -233,7 +268,7 @@ export function DashboardView({
             {metrics.addedThisMonthCount}
           </div>
           <div className="text-xs text-slate-500 mt-2 font-mono tabular-nums">
-            {formatCurrency(metrics.addedThisMonthValue)} added book value
+            {formatCurrency(metrics.addedThisMonthValue, reportingCurrency)} added book value
           </div>
         </div>
       </section>
@@ -249,8 +284,9 @@ export function DashboardView({
               No Corporate Assets Registered Yet
             </h2>
             <p className="text-sm text-slate-600 leading-relaxed">
-              Register your first piece of IT hardware, fleet vehicle, or facility equipment—or
-              load a sample catalog to explore valuation analytics, QR tags, and offline sync.
+              Register your first piece of IT hardware, fleet vehicle, or facility equipment in any
+              supported currency—or load a multicurrency sample catalog (USD, EUR, GBP) to explore
+              consolidated valuation analytics.
             </p>
             <div className="flex flex-col sm:flex-row items-center justify-center gap-3 pt-2">
               <button
@@ -268,7 +304,7 @@ export function DashboardView({
                 className="w-full sm:w-auto min-h-[44px] px-5 py-2.5 text-xs font-medium text-slate-800 bg-slate-100 hover:bg-slate-200 disabled:opacity-50 rounded-xl transition-colors inline-flex items-center justify-center gap-2 whitespace-nowrap"
               >
                 {isSeeding && <Loader2 className="w-4 h-4 animate-spin" />}
-                <span>Load Sample Inventory</span>
+                <span>Load Multicurrency Sample</span>
               </button>
             </div>
           </div>
@@ -283,7 +319,7 @@ export function DashboardView({
                 <div className="flex items-center justify-between mb-5">
                   <div>
                     <h2 className="text-base font-semibold text-slate-900">
-                      Valuation by Asset Category
+                      Valuation by Asset Category ({reportingCurrency})
                     </h2>
                     <p className="text-xs text-slate-500 mt-0.5">
                       Select any category to inspect matching inventory records
@@ -309,7 +345,7 @@ export function DashboardView({
                           </span>
                         </div>
                         <div className="text-xs font-mono tabular-nums text-slate-900 font-medium shrink-0">
-                          {formatCurrency(item.valuation)}{' '}
+                          {formatCurrency(item.valuation, reportingCurrency)}{' '}
                           <span className="text-slate-400">({item.sharePct}%)</span>
                         </div>
                       </div>
@@ -334,7 +370,7 @@ export function DashboardView({
                   Lifecycle Status Breakdown
                 </h2>
                 <p className="text-xs text-slate-500 mt-0.5 mb-4">
-                  Operational readiness across tracked units
+                  Operational readiness consolidated in {reportingCurrency}
                 </p>
 
                 <div className="divide-y divide-slate-100">
@@ -352,7 +388,7 @@ export function DashboardView({
                             {st.status}
                           </div>
                           <div className="text-xs text-slate-500 font-mono tabular-nums">
-                            {formatCurrency(st.valuation)}
+                            {formatCurrency(st.valuation, reportingCurrency)}
                           </div>
                         </div>
                       </div>
@@ -409,54 +445,66 @@ export function DashboardView({
             </div>
 
             <div className="divide-y divide-slate-100">
-              {assets.slice(0, 5).map((asset) => (
-                <button
-                  key={asset.assetId}
-                  type="button"
-                  onClick={() => onSelectAsset(asset)}
-                  className="w-full min-h-[64px] px-6 py-3.5 flex items-center justify-between gap-4 hover:bg-slate-50 transition-colors text-left"
-                >
-                  <div className="flex items-center gap-4 min-w-0">
-                    <div className="w-12 h-12 rounded-xl overflow-hidden border border-slate-200 bg-slate-50 shrink-0">
-                      <AssetImage
-                        src={asset.photoUrl}
-                        alt={asset.name}
-                        category={asset.category}
-                      />
-                    </div>
-                    <div className="min-w-0">
-                      <div className="text-sm font-semibold text-slate-900 truncate">
-                        {asset.name}
-                      </div>
-                      <div className="text-xs text-slate-500 mt-0.5 flex flex-wrap items-center gap-x-1.5 gap-y-0.5">
-                        <span className="font-mono text-slate-700">{asset.serialNumber}</span>
-                        <span aria-hidden="true">·</span>
-                        <span>{asset.category}</span>
-                        <span aria-hidden="true">·</span>
-                        <span>{asset.status}</span>
-                        {asset.assignedTo && (
-                          <>
-                            <span aria-hidden="true">·</span>
-                            <span>{asset.assignedTo}</span>
-                          </>
-                        )}
-                      </div>
-                    </div>
-                  </div>
+              {assets.slice(0, 5).map((asset) => {
+                const converted =
+                  asset.currency !== reportingCurrency
+                    ? convertCurrency(
+                        asset.currentValuation,
+                        asset.currency,
+                        reportingCurrency,
+                        usdRates
+                      )
+                    : null;
 
-                  <div className="flex items-center gap-3 shrink-0">
-                    <div className="text-right">
-                      <div className="text-sm font-semibold font-mono tabular-nums text-slate-900">
-                        {formatCurrency(asset.currentValuation)}
+                return (
+                  <button
+                    key={asset.assetId}
+                    type="button"
+                    onClick={() => onSelectAsset(asset)}
+                    className="w-full min-h-[64px] px-6 py-3.5 flex items-center justify-between gap-4 hover:bg-slate-50 transition-colors text-left"
+                  >
+                    <div className="flex items-center gap-4 min-w-0">
+                      <div className="w-12 h-12 rounded-xl overflow-hidden border border-slate-200 bg-slate-50 shrink-0">
+                        <AssetImage
+                          src={asset.photoUrl}
+                          alt={asset.name}
+                          category={asset.category}
+                        />
                       </div>
-                      <div className="text-[11px] text-slate-500">
-                        {asset.hasPendingWrites ? 'Saved locally' : asset.department}
+                      <div className="min-w-0">
+                        <div className="text-sm font-semibold text-slate-900 truncate">
+                          {asset.name}
+                        </div>
+                        <div className="text-xs text-slate-500 mt-0.5 flex flex-wrap items-center gap-x-1.5 gap-y-0.5">
+                          <span className="font-mono text-slate-700">{asset.serialNumber}</span>
+                          <span aria-hidden="true">·</span>
+                          <span>{asset.category}</span>
+                          <span aria-hidden="true">·</span>
+                          <span>{asset.status}</span>
+                          <span aria-hidden="true">·</span>
+                          <span className="font-mono">{asset.currency}</span>
+                        </div>
                       </div>
                     </div>
-                    <ChevronRight className="w-4 h-4 text-slate-400" />
-                  </div>
-                </button>
-              ))}
+
+                    <div className="flex items-center gap-3 shrink-0">
+                      <div className="text-right">
+                        <div className="text-sm font-semibold font-mono tabular-nums text-slate-900">
+                          {formatCurrency(asset.currentValuation, asset.currency)}
+                        </div>
+                        <div className="text-[11px] font-mono tabular-nums text-slate-500">
+                          {converted !== null
+                            ? `≈ ${formatCurrency(converted, reportingCurrency)}`
+                            : asset.hasPendingWrites
+                            ? 'Saved locally'
+                            : asset.department}
+                        </div>
+                      </div>
+                      <ChevronRight className="w-4 h-4 text-slate-400" />
+                    </div>
+                  </button>
+                );
+              })}
             </div>
           </section>
         </>
